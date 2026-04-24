@@ -1,0 +1,31 @@
+# macOS 系统文件
+.DS_Store
+.DS_Store?
+._*
+
+# 数据文件（包含内部资产信息，不上传）
+*.xlsx
+*.csv
+*.json
+
+# 采集的原始数据目录
+server_hw_data/
+
+# 二进制工具包（rpm/deb 正常上传，只排除超大 zip 包）
+tools/*.zip
+tools/Unified_storcli_all_os/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 日志文件
+*.log
+scan_*.log
+failed.log
+
+# 备份文件
+*_backup*
+~$*

@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ANTIY CMDB - Hardware Intelligence</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --glass-bg: rgba(17, 25, 40, 0.75);
+            --glass-border: rgba(255, 255, 255, 0.125);
+            --accent-cyan: #00f2fe;
+            --accent-purple: #4facfe;
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --error-color: #ef4444;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(0, 242, 254, 0.15) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(79, 172, 254, 0.15) 0px, transparent 50%);
+            background-attachment: fixed;
+            color: var(--text-main);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--glass-border);
+        }
+
+        .logo h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(to right, var(--accent-cyan), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        /* Top Summary Cards */
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 3rem;
+        }
+
+        .glass-card {
+            background-color: var(--glass-bg);
+            backdrop-filter: blur(16px) saturate(180%);
+            -webkit-backdrop-filter: blur(16px) saturate(180%);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .glass-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 242, 254, 0.1);
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-top: 0.5rem;
+        }
+
+        /* Node List (Row by Row) */
+        .node-list {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .node-row {
+            display: grid;
+            grid-template-columns: 1.5fr 1.2fr 1fr 1.5fr 2fr 0.8fr 0.8fr 0.8fr 50px;
+            align-items: center;
+            padding: 1.2rem 1.5rem;
+            cursor: pointer;
+            background-color: var(--glass-bg);
+            backdrop-filter: blur(16px) saturate(180%);
+            border: 1px solid var(--glass-border);
+            border-radius: 8px;
+            transition: all 0.2s ease;
+        }
+
+        .node-row:hover {
+            background-color: rgba(0, 242, 254, 0.05);
+            border-color: var(--accent-cyan);
+            transform: translateX(8px);
+        }
+
+        .node-cell {
+            display: flex;
+            flex-direction: column;
+            padding-right: 1rem;
+            overflow: hidden;
+        }
+
+        .cell-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 0.4rem;
+        }
+
+        .cell-val {
+            font-size: 0.95rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .cell-sn {
+            color: var(--accent-cyan);
+            font-family: 'Roboto Mono', monospace;
+            font-weight: 700;
+        }
+
+        .status-dot {
+            width: 12px; height: 12px;
+            background-color: #10b981;
+            border-radius: 50%;
+            box-shadow: 0 0 10px #10b981;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.error {
+            background-color: var(--error-color);
+            box-shadow: 0 0 10px var(--error-color);
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.95); opacity: 0.8; }
+            50% { transform: scale(1.2); opacity: 1; }
+            100% { transform: scale(0.95); opacity: 0.8; }
+        }
+
+        /* Slide-over Panel */
+        .slide-over {
+            position: fixed;
+            top: 0; right: -800px;
+            width: 100%; max-width: 800px;
+            height: 100vh;
+            background-color: rgba(11, 15, 25, 0.95);
+            backdrop-filter: blur(20px);
+            border-left: 1px solid var(--glass-border);
+            transition: right 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            z-index: 1000;
+            overflow-y: auto;
+            padding: 2rem;
+            box-shadow: -10px 0 30px rgba(0,0,0,0.5);
+        }
+
+        .slide-over.open { right: 0; }
+
+        .slide-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--glass-border);
+        }
+
+        .close-btn {
+            background: none; border: none;
+            color: var(--text-muted);
+            font-size: 2rem;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
+
+        .close-btn:hover { color: var(--accent-cyan); }
+
+        .overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            opacity: 0; pointer-events: none;
+            transition: opacity 0.3s;
+            z-index: 999;
+        }
+
+        .overlay.open { opacity: 1; pointer-events: all; }
+
+        /* Detail Tables */
+        .hw-section { margin-bottom: 2.5rem; }
+        .hw-section h3 {
+            color: var(--accent-purple);
+            margin-bottom: 1rem;
+            display: inline-block;
+            border-bottom: 2px solid var(--accent-cyan);
+            padding-bottom: 0.3rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(255,255,255,0.02);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        th, td {
+            padding: 0.8rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.9rem;
+        }
+
+        th {
+            background: rgba(255,255,255,0.05);
+            color: var(--text-muted);
+            font-weight: 600;
+        }
+
+        td { color: var(--text-main); }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: rgba(0, 242, 254, 0.05); }
+
+        .json-dump {
+            background: #0f172a;
+            padding: 1rem;
+            border-radius: 8px;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 0.85rem;
+            color: #38bdf8;
+            overflow-x: auto;
+            border: 1px solid #1e293b;
+        }
+
+        .error-log { color: var(--error-color); margin-top: 5px; font-size: 0.85rem;}
+        
+        /* Spinner */
+        #loader { text-align: center; margin-top: 5rem; color: var(--accent-cyan); }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <header>
+            <div class="logo">
+                <h1>ANTIY CMDB</h1>
+                <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 5px;">Hardware Intelligence Dashboard</p>
+            </div>
+            <div style="display:flex; align-items:center; gap:1rem;">
+                <div id="last-updated" style="color: var(--text-muted); font-size: 0.9rem;"></div>
+                <a href="/api/v1/export_csv" style="background:linear-gradient(135deg,#00f2fe,#4facfe); color:#0b1120; padding:0.5rem 1.2rem; border-radius:8px; text-decoration:none; font-weight:bold; font-size:0.85rem; white-space:nowrap;">📥 导出 CSV</a>
+            </div>
+        </header>
+
+        <div class="summary-cards">
+            <div class="glass-card">
+                <p style="color: var(--text-muted)">Total Nodes Monitored</p>
+                <div class="stat-value" id="stat-nodes">0</div>
+            </div>
+            <div class="glass-card">
+                <p style="color: var(--text-muted)">Total Storage Capacity</p>
+                <div class="stat-value" id="stat-disks">0</div>
+            </div>
+            <div class="glass-card">
+                <p style="color: var(--text-muted)">Memory Provisioned</p>
+                <div class="stat-value" id="stat-mem">0 GB</div>
+            </div>
+            <div class="glass-card">
+                <p style="color: var(--text-muted)">System Alerts</p>
+                <div class="stat-value" id="stat-alerts" style="color: var(--error-color)">0</div>
+            </div>
+        </div>
+
+        <div id="loader"><h2>Scanning Nexus...</h2></div>
+        
+        <div class="node-list" id="node-list">
+            <!-- Rows injected via JS -->
+        </div>
+    </div>
+
+    <!-- Slide Over Panel -->
+    <div class="overlay" id="overlay" onclick="closePanel()"></div>
+    <div class="slide-over" id="slide-panel">
+        <div class="slide-header">
+            <div>
+                <h2 id="panel-title" style="color: var(--text-main);">Node Details</h2>
+                <p id="panel-subtitle" style="color: var(--text-muted); margin-top:5px;"></p>
+            </div>
+            <button class="close-btn" onclick="closePanel()">&times;</button>
+        </div>
+        <div id="panel-content">
+            <!-- Injected via JS -->
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', fetchNodes);
+
+        async function fetchNodes() {
+            try {
+                const response = await fetch('/api/v1/nodes');
+                const result = await response.json();
+                
+                if(result.status === 'success') {
+                    renderDashboard(result.data);
+                }
+            } catch (error) {
+                console.error("Error fetching nodes:", error);
+                document.getElementById('loader').innerHTML = `<h2 style="color:red">Connection to Nexus Lost</h2>`;
+            }
+        }
+
+        function renderDashboard(nodes) {
+            document.getElementById('loader').style.display = 'none';
+            document.getElementById('last-updated').innerText = `Live 🟢 | Last scan: ${new Date().toLocaleTimeString()}`;
+            
+            // Update Stats
+            document.getElementById('stat-nodes').innerText = nodes.length;
+            let totalDisks = nodes.reduce((acc, curr) => acc + curr.disk_count, 0);
+            document.getElementById('stat-disks').innerText = totalDisks + " Drives";
+            let totalMem = nodes.reduce((acc, curr) => acc + curr.total_memory_gb, 0);
+            document.getElementById('stat-mem').innerText = Math.round(totalMem) + " GB";
+            let totalAlerts = nodes.reduce((acc, curr) => acc + curr.errors, 0);
+            document.getElementById('stat-alerts').innerText = totalAlerts;
+
+            // Render List
+            const listContainer = document.getElementById('node-list');
+            listContainer.innerHTML = '';
+
+            nodes.forEach(node => {
+                const isError = node.errors > 0;
+                const row = document.createElement('div');
+                row.className = 'node-row';
+                row.onclick = () => openPanel(node.sn);
+                
+                row.innerHTML = `
+                    <div class="node-cell">
+                        <span class="cell-label">Serial Number</span>
+                        <span class="cell-val cell-sn">${node.sn}</span>
+                    </div>
+                    <div class="node-cell">
+                        <span class="cell-label">IP Address</span>
+                        <span class="cell-val" style="font-family:monospace; font-size:0.85rem;" title="${node.ip || ''}">${node.ip || '-'}</span>
+                    </div>
+                    <div class="node-cell">
+                        <span class="cell-label">Manufacturer</span>
+                        <span class="cell-val">${node.manufacturer}</span>
+                    </div>
+                    <div class="node-cell">
+                        <span class="cell-label">Model</span>
+                        <span class="cell-val" title="${node.product}">${node.product}</span>
+                    </div>
+                    <div class="node-cell">
+                        <span class="cell-label">Processor</span>
+                        <span class="cell-val" style="color:var(--text-muted)" title="${node.cpu_model}">${node.cpu_model.split('@')[0].substring(0,25)}${node.cpu_model.length>25?'...':''}</span>
+                    </div>
+                    <div class="node-cell">
+                        <span class="cell-label">Memory</span>
+                        <span class="cell-val">${node.total_memory_gb} GB</span>
+                    </div>
+                    <div class="node-cell">
+                        <span class="cell-label">Storage</span>
+                        <span class="cell-val">${node.disk_count} Disks</span>
+                    </div>
+                    <div class="node-cell">
+                        <span class="cell-label">Network</span>
+                        <span class="cell-val">${node.net_count} Ports</span>
+                    </div>
+                    <div class="node-cell" style="align-items: flex-end;">
+                        <div class="status-dot ${isError ? 'error' : ''}" title="${isError ? node.errors + ' Alerts' : 'OK'}"></div>
+                    </div>
+                `;
+                listContainer.appendChild(row);
+            });
+        }
+
+        async function openPanel(sn) {
+            document.getElementById('overlay').classList.add('open');
+            document.getElementById('slide-panel').classList.add('open');
+            document.getElementById('panel-content').innerHTML = '<h3 style="color:#00f2fe">Decrypting telemetry...</h3>';
+            document.getElementById('panel-title').innerText = `SN: ${sn}`;
+
+            try {
+                const response = await fetch(`/api/v1/node/${sn}`);
+                const result = await response.json();
+                
+                if(result.status === 'success') {
+                    renderDetails(result.data);
+                }
+            } catch (error) {
+                document.getElementById('panel-content').innerHTML = '<h3 style="color:red">Failed to load details</h3>';
+            }
+        }
+
+        function closePanel() {
+            document.getElementById('overlay').classList.remove('open');
+            document.getElementById('slide-panel').classList.remove('open');
+        }
+
+        function renderDetails(data) {
+            const sys = data.system || {};
+            document.getElementById('panel-subtitle').innerText = `${sys.manufacturer} ${sys.product_name} | IP: ${sys.ip_address}`;
+            
+            let html = '';
+
+            // Errors
+            if(data.errors && data.errors.length > 0) {
+                html += `<div class="hw-section"><h3 style="color:var(--error-color); border-color:var(--error-color)">⚠ System Alerts</h3>`;
+                data.errors.forEach(err => html += `<div class="error-log">${err}</div>`);
+                html += `</div>`;
+            }
+
+            // CPU
+            if(data.cpu) {
+                html += `
+                <div class="hw-section">
+                    <h3>Processor (CPU)</h3>
+                    <table>
+                        <tr><th>Model</th><td>${data.cpu.model}</td></tr>
+                        <tr><th>Architecture</th><td>${data.cpu.architecture}</td></tr>
+                        <tr><th>Physical Cores</th><td>${data.cpu.physical_cores}</td></tr>
+                        <tr><th>Logical Threads</th><td>${data.cpu.logical_cores}</td></tr>
+                    </table>
+                </div>`;
+            }
+
+            // Memory
+            // 内存容量归一化：兼容旧数据中的 MB 单位
+            function normMemSize(s) {
+                if (!s) return s;
+                let m = s.match(/^(\d+)\s*(MB|GB|TB|KB)/i);
+                if (m) {
+                    let val = parseInt(m[1]), unit = m[2].toUpperCase();
+                    if (unit === 'MB' && val >= 1024) return (val / 1024) + ' GB';
+                    if (unit === 'KB' && val >= 1048576) return (val / 1048576) + ' GB';
+                    if (unit === 'TB') return (val * 1024) + ' GB';
+                }
+                return s;
+            }
+            if(data.memory_modules && data.memory_modules.length > 0) {
+                html += `<div class="hw-section"><h3>Memory Topology</h3><table>`;
+                html += `<tr><th>Locator</th><th>Manufacturer</th><th>Part Number</th><th>Size</th><th>Speed</th><th>S/N</th></tr>`;
+                data.memory_modules.forEach(m => {
+                    html += `<tr>
+                        <td>${m.locator}</td>
+                        <td>${m.manufacturer}</td>
+                        <td>${m.part_number}</td>
+                        <td style="color:var(--accent-cyan)">${normMemSize(m.size)}</td>
+                        <td>${m.speed}</td>
+                        <td style="font-family:monospace">${m.serial_number}</td>
+                    </tr>`;
+                });
+                html += `</table></div>`;
+            }
+
+            // Network
+            if(data.network_interfaces && data.network_interfaces.length > 0) {
+                html += `<div class="hw-section"><h3>Network Interfaces</h3><table>`;
+                html += `<tr><th>Name</th><th>MAC Address</th><th>Port Type</th><th>Speed</th><th>Manufacturer</th></tr>`;
+                data.network_interfaces.forEach(n => {
+                    html += `<tr>
+                        <td>${n.name}</td>
+                        <td style="font-family:monospace">${n.mac}</td>
+                        <td>${n.port_type}</td>
+                        <td style="color:var(--accent-cyan)">${n.speed}</td>
+                        <td>${n.manufacturer}</td>
+                    </tr>`;
+                });
+                html += `</table></div>`;
+            }
+
+            // Disks
+            if(data.physical_disks && data.physical_disks.length > 0) {
+                // 生成合并摘要行: Slot0 2TB｜HGST HUS724020ALS640 P6GNYARU；Slot1 ...
+                let diskSummary = data.physical_disks.map((d, idx) => {
+                    let slot = d.name || ('Slot' + idx);
+                    let size = d.size || '?';
+                    let mfr = (d.manufacturer && d.manufacturer !== 'Unknown') ? d.manufacturer : '';
+                    let model = (d.model && d.model !== 'Unknown') ? d.model : '';
+                    let sn = (d.serial_number && d.serial_number !== 'Unknown') ? d.serial_number : '';
+                    return `${slot} ${size}｜${mfr} ${model} ${sn}`.trim();
+                }).join('；');
+
+                html += `<div class="hw-section"><h3>Physical Disks (RAID Passed)</h3><table>`;
+                // 合并摘要行
+                html += `<tr><td colspan="6" style="color:var(--accent-cyan); font-size:0.85rem; line-height:1.8; padding:1rem; word-break:break-all; white-space:normal;">${diskSummary}</td></tr>`;
+                html += `<tr><th>Slot/Name</th><th>Manufacturer & Model</th><th>Type</th><th>Size</th><th>S/N</th><th>Provider</th></tr>`;
+                data.physical_disks.forEach(d => {
+                    html += `<tr>
+                        <td>${d.name || '-'}</td>
+                        <td>${d.manufacturer} ${d.model}</td>
+                        <td>${d.type || '-'}</td>
+                        <td style="color:var(--accent-purple); font-weight:bold">${d.size}</td>
+                        <td style="font-family:monospace">${d.serial_number}</td>
+                        <td style="font-size:0.8rem; color:var(--text-muted)">${d.provider}</td>
+                    </tr>`;
+                });
+                html += `</table></div>`;
+            }
+
+            // GPU
+            if(data.gpu_devices && data.gpu_devices.length > 0) {
+                html += `<div class="hw-section"><h3>GPU / Accelerators</h3><table>`;
+                html += `<tr><th>Name</th><th>Manufacturer</th><th>VRAM</th><th>Driver</th><th>PCI Addr</th><th>S/N</th></tr>`;
+                data.gpu_devices.forEach(g => {
+                    html += `<tr>
+                        <td style="color:var(--accent-cyan); font-weight:bold">${g.name}</td>
+                        <td>${g.manufacturer}</td>
+                        <td style="color:var(--accent-purple); font-weight:bold">${g.vram || '-'}</td>
+                        <td>${g.driver_version || '-'}</td>
+                        <td style="font-family:monospace; font-size:0.85rem">${g.pci_address || '-'}</td>
+                        <td style="font-family:monospace">${g.serial_number || '-'}</td>
+                    </tr>`;
+                });
+                html += `</table></div>`;
+            }
+
+            html += `<div class="hw-section"><h3>Raw Agent Payload</h3>
+                <div class="json-dump">${JSON.stringify(data, null, 2)}</div>
+            </div>`;
+
+            document.getElementById('panel-content').innerHTML = html;
+        }
+
+        // Close panel on Esc key
+        document.addEventListener('keydown', (e) => {
+            if(e.key === 'Escape') closePanel();
+        });
+    </script>
+</body>
+</html>
