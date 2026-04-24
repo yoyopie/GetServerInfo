@@ -30,9 +30,11 @@
 服务端可以独立运行（会使用本地 JSON 文件兜底保存），或者如果有 PostgreSQL 数据库，它会自动使用 Postgres 进行结构化存储。
 ```bash
 # 启动服务端 (默认监听 8080 端口)
-python3 receiver.py
+python receiver.py
 ```
 > **注意**：大屏页面地址为 `http://您的服务器IP:8080/`。
+
+> **Python 版本**：所有脚本兼容 Python 2.7 及 Python 3.x。`worker.sh` 会自动探测目标机器上可用的 Python 版本（优先 python3，其次 python，再次 python2），无需手动指定。
 
 ### 2. Linux 物理机/虚拟机采集 (探针模式)
 **单台机器直接执行：**
@@ -52,7 +54,7 @@ cat ip_list.txt | xargs -n1 -P50 ./worker.sh
 由于 ESXi 闭源且缺少标准工具包，我们提供了独立的远程提取方案：
 ```bash
 # 启动扫描 (按提示输入密码或传参)
-python3 esxi_scanner.py <ESXi管理IP> <账号> <密码>
+python esxi_scanner.py --host <ESXi管理IP> --user <账号> --password <密码> --server http://<YOUR_SERVER_IP>:8080/api/v1/upload_hwinfo
 ```
 > ESXi **必须开启了 CIM 服务** 才能捕获精确的内存拓扑。你可以通过 vSphere 开启 `sfcbd-watchdog` 服务。
 
