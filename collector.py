@@ -925,10 +925,24 @@ def get_disk_info():
     """
     disks = []
     
-    # 策略 1: 检查是否存在 storcli (针对 LSI/Broadcom/Dell)
-    storcli_path = run_cmd("which storcli 2>/dev/null") or run_cmd("which storcli64 2>/dev/null")
-    if not storcli_path and os.path.exists("/opt/MegaRAID/storcli/storcli64"):
-        storcli_path = "/opt/MegaRAID/storcli/storcli64"
+    # 策略 1: 检查是否存在 storcli (针对 LSI/Broadcom/Dell/Huawei)
+    # 注意：新版 storcli rpm 安装后可能叫 storcli 而非 storcli64
+    storcli_path = (
+        run_cmd("which storcli64 2>/dev/null").strip() or
+        run_cmd("which storcli 2>/dev/null").strip()
+    )
+    if not storcli_path:
+        for _p in [
+            "/opt/MegaRAID/storcli/storcli64",
+            "/opt/MegaRAID/storcli/storcli",
+            "/usr/sbin/storcli64",
+            "/usr/sbin/storcli",
+            "/usr/local/sbin/storcli64",
+            "/usr/local/sbin/storcli",
+        ]:
+            if os.path.exists(_p):
+                storcli_path = _p
+                break
         
     if storcli_path:
         out = run_cmd(storcli_path + " /call /eall /sall show all J")
