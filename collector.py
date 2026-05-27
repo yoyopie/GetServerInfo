@@ -1022,6 +1022,10 @@ def get_disk_info():
                     basics  = {}   # "Drive /cX/eY/sZ" -> dict
                     details = {}   # "Drive /cX/eY/sZ" -> detail dict
                     for rkey, rval in resp.items():
+                        # storcli basic 条目的 value 可能是 list([{...}]) 而非 dict
+                        # 如果是只含一个 dict 的 list，自动解包
+                        if isinstance(rval, list) and len(rval) == 1 and isinstance(rval[0], dict):
+                            rval = rval[0]
                         if not isinstance(rval, dict):
                             continue
                         m_basic  = re.match(r'^(Drive /c\d+/e\d+/s\d+)$', rkey)
