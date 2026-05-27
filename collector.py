@@ -755,6 +755,127 @@ def _get_real_disk_sn(dev_name, sn_candidate):
     # 所有方法均未能改善，返回原候选值
     return sn_candidate
 
+def _probe_megaraid_physical_drives(vd_dev_name):
+    """
+    利用 smartctl MegaRAID pass-through 模式，透过 RAID 控制器查询背后的真实物理盘。
+    支持 Broadcom/Avago/LSI MegaRAID 兴容控制器（华为 2288H 上常用）。
+    命令示例: smartctl -i -d megaraid,0 /dev/sdf
+
+    :param vd_dev_name: RAID 虚拟盘设备名，如 'sdf' 或 '/dev/sdf'
+    :return: list of physical drive dicts
+    """
+    smartctl_bin = run_cmd("which smartctl 2>/dev/null").strip()
+    if not smartctl_bin:
+        return []
+
+    dev_path = vd_dev_name if vd_dev_name.startswith("/dev/") else "/dev/" + vd_dev_name
+    found_drives = []
+    consecutive_failures = 0
+
+    for slot in range(32):  # MegaRAID 最多支持每控制器 32 块物理盘
+        out = run_cmd("{0} -i -d megaraid,{1} {2} 2>/dev/null".format(
+            smartctl_bin, slot, dev_path))
+
+        # 无输出或控制器明确不支持
+        if not out:
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                break
+            continue
+
+        out_lower = out.lower()
+        # 控制器不支持 megaraid pass-through → 完全放弃
+        if ("no such device" in out_lower or
+                "unable to detect" in out_lower or
+                "requires '-d' option" in out_lower or
+                "open failed" in out_lower):
+            break
+
+        # 该槽位没有磁盘插入
+        if "device does not support" in out_lower or "failed" in out_lower:
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                break
+            continue
+
+        # 解析磁盘信息
+        sn_m    = re.search(r'^Serial Number:\s*(\S+)',    out, re.MULTILINE | re.IGNORECASE)
+        model_m = re.search(r'^(?:Device Model|Product):\s*(.+)', out, re.MULTILINE | re.IGNORECASE)
+        cap_m   = re.search(r'^User Capacity:\s*(.+)',    out, re.MULTILINE | re.IGNORECASE)
+        rpm_m   = re.search(r'^Rotation Rate:\s*(.+)',    out, re.MULTILINE | re.IGNORECASE)
+
+        if not sn_m:
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                break
+            continue
+
+        consecutive_failures = 0  # 成功读到一块，重置计数器
+
+        sn        = sn_m.group(1).strip()
+        model_raw = model_m.group(1).strip() if model_m else "Unknown"
+        cap_raw   = cap_m.group(1).strip()   if cap_m   else ""
+        rpm_raw   = rpm_m.group(1).strip()   if rpm_m   else ""
+
+        # 容量解析: 优先从 [X.XX TB] 括号内取，其次从 bytes 计算
+        size_str = "Unknown"
+        bracket_m = re.search(r'\[([^\]]+(?:TB|GB|MB|KB)[^\]]*)\]', cap_raw, re.IGNORECASE)
+        if bracket_m:
+            size_str = bracket_m.group(1).strip()
+        else:
+            bytes_m = re.search(r'([\d,]+)\s+bytes', cap_raw)
+            if bytes_m:
+                try:
+                    bv = int(bytes_m.group(1).replace(",", ""))
+                    if bv >= 1024 ** 4:
+                        size_str = "{0:.2f} TB".format(bv / (1024 ** 4))
+                    elif bv >= 1024 ** 3:
+                        size_str = "{0:.0f} GB".format(bv / (1024 ** 3))
+                    else:
+                        size_str = "{0:.0f} MB".format(bv / (1024 ** 2))
+                except Exception:
+                    pass
+
+        # 磁盘类型
+        disk_type = "Unknown"
+        if rpm_raw:
+            rpm_lower = rpm_raw.lower()
+            if "solid state" in rpm_lower or rpm_raw.strip() == "0":
+                disk_type = "SSD"
+            elif re.search(r'\d+', rpm_raw):
+                disk_type = "HDD"
+
+        # 厂商 + 型号拆分
+        parts = model_raw.split(None, 1)
+        if len(parts) > 1:
+            manufacturer, model = parts[0], parts[1]
+        else:
+            manufacturer, model = "Unknown", model_raw
+
+        mfr_up = manufacturer.upper()
+        mod_up = model_raw.upper()
+        if "SEAGATE" in mfr_up or mod_up.startswith("ST"): manufacturer = "Seagate"
+        elif mfr_up.startswith("WD") or "WESTERN" in mfr_up:  manufacturer = "Western Digital"
+        elif "TOSHIBA" in mfr_up:   manufacturer = "Toshiba"
+        elif "HGST" in mfr_up:      manufacturer = "HGST"
+        elif "SAMSUNG" in mfr_up or mod_up.startswith("MZ"): manufacturer = "Samsung"
+        elif "MICRON" in mfr_up:    manufacturer = "Micron"
+        elif "INTEL" in mfr_up:     manufacturer = "Intel"
+        elif "KIOXIA" in mfr_up:    manufacturer = "KIOXIA"
+
+        found_drives.append({
+            "manufacturer": manufacturer,
+            "model": model,
+            "serial_number": sn,
+            "size": size_str,
+            "type": disk_type,
+            "slot": slot,
+            "provider": "smartctl-megaraid",
+            "via": dev_path
+        })
+
+    return found_drives
+
 
 def get_disk_info():
     """
@@ -1053,31 +1174,45 @@ def get_disk_info():
                     "provider": "OS-lsblk"
                 })
 
-    # ---- RAID 虚拟盘识别 ----
-    # 已知 RAID 控制器在 OS 层面呈现的逻辑卷特征（型号含控制器芯片名）：
-    # HW-SAS3408 / HW-SAS3416 (华为), MR (LSI MegaRAID VD), etc.
+    # ---- RAID 虚拟盘识别并尝试穿透查询物理盘 ----
+    # 已知 RAID 控制器在 OS 层面呈现的逻辑卷特征
     RAID_VD_MODEL_KEYWORDS = [
-        "hw-sas", "hw_sas", "megaraid", "raid", "virtual",
+        "hw-sas", "hw_sas",          # 华为 HW-SAS3408 / HW-SAS3416
+        "avago", "broadcom", "lsi",  # Broadcom/Avago/LSI MegaRAID 控制器
+        "megaraid", "mr",             # LSI MegaRAID 虚拟盘标识
+        "raid", "virtual",
     ]
-    # 额外判断：NAA-6 (32位hex) 一定是 RAID 控制器 LUN，绝对不是物理盘
     physical = []
     raid_vd  = []
     for d in disks:
         model_lower = d.get("model", "").lower()
         sn_val      = d.get("serial_number", "")
         is_raid_vd  = False
-        # 1. 32位 NAA-6 LUN ID → RAID 虚拟盘
+        # 1. NAA-6 (28位以上hex) → RAID 控制器 LUN，必不是物理盘
         if _is_wwn(sn_val) and len(sn_val.strip().lower().lstrip("0x")) >= 28:
             is_raid_vd = True
-        # 2. 模型名含已知 RAID 控制器关键字
+        # 2. 型号名含已知 RAID 控制器关键字
         if not is_raid_vd:
             for kw in RAID_VD_MODEL_KEYWORDS:
                 if kw in model_lower:
                     is_raid_vd = True
                     break
         if is_raid_vd:
-            d["note"] = ("RAID virtual drive - physical disks behind this controller are not visible "
-                         "to the OS. Install storcli/storcli64 and re-run to enumerate physical drives.")
+            dev_name = d.get("name", "")
+            # 尝试通过 smartctl megaraid pass-through 穿透查询物理盘
+            probed = _probe_megaraid_physical_drives(dev_name) if dev_name else []
+            if probed:
+                physical.extend(probed)
+                d["note"] = (
+                    "RAID virtual drive - {0} physical drive(s) detected via "
+                    "smartctl megaraid pass-through.".format(len(probed))
+                )
+            else:
+                d["note"] = (
+                    "RAID virtual drive - physical disks behind this controller are not "
+                    "visible to the OS. Install storcli/storcli64 and re-run to enumerate "
+                    "physical drives."
+                )
             raid_vd.append(d)
         else:
             physical.append(d)
