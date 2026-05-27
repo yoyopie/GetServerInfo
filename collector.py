@@ -968,8 +968,23 @@ def get_disk_info():
                 break
         
     if storcli_path:
-        out = run_cmd(storcli_path + " /call /eall /sall show all J")
+        storcli_path = storcli_path.strip()
+        try:
+            # 直接用 Popen 捕获输出，不依赖 returncode（storcli 可能返回非 0 即使成功）
+            _p = subprocess.Popen(
+                [storcli_path, "/call", "/eall", "/sall", "show", "all", "J"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            _stdout, _ = _p.communicate()
+            try:
+                out = _stdout.decode("utf-8", "ignore").strip()
+            except AttributeError:
+                out = _stdout.strip()
+        except Exception as _e:
+            out = ""
+            print("[WARNING] storcli execution failed: {0}".format(str(_e)))
         if out:
+
             try:
                 data = json.loads(out)
                 # 解析 storcli JSON
