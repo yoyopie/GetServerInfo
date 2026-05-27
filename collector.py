@@ -997,9 +997,14 @@ def get_disk_info():
         except Exception as _e:
             out = ""
             print("[WARNING] storcli execution failed: {0}".format(str(_e)))
-        if out:
+        print("[DEBUG] storcli path={0}, output_len={1}".format(storcli_path, len(out)))
+        if out and out.strip():
 
             try:
+                # 尝试找到 JSON 开始位置（部分 storcli 版本前面有非 JSON 文字）
+                json_start = out.find('{')
+                if json_start > 0:
+                    out = out[json_start:]
                 data = json.loads(out)
                 # storcli JSON 结构（Broadcom 标准格式）:
                 #   "Response Data": {
