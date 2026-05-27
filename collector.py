@@ -287,15 +287,14 @@ def auto_install_raid_tools(sys_info, server_url=None):
         if not has_storcli:
             tools_needed.append(("storcli", get_storcli_filename()))
         else:
-            # 已安装但不在 PATH → 自动补建软链接，方便命令行和 which 找到
+            # 已安装但不在 PATH → 自动补建软链接
             if not run_cmd("which storcli64 2>/dev/null") and not run_cmd("which storcli 2>/dev/null"):
                 for _bin in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
                              "/usr/sbin/storcli64", "/usr/sbin/storcli"]:
                     if os.path.exists(_bin):
                         _sym = "/usr/local/sbin/" + os.path.basename(_bin)
                         try:
-                            if os.path.lexists(_sym):
-                                os.remove(_sym)
+                            if os.path.lexists(_sym): os.remove(_sym)
                             os.symlink(_bin, _sym)
                             print("[INFO] storcli already installed; created symlink: {0} -> {1}".format(_sym, _bin))
                         except Exception as _se:
@@ -340,27 +339,13 @@ def auto_install_raid_tools(sys_info, server_url=None):
             if not ok and run_cmd("which ssacli 2>/dev/null"):
                 print("[SUCCESS] ssacli installed."); ok = True
         elif tool == "storcli":
-            storcli_bin = None
             for p in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
                       "/usr/sbin/storcli64", "/usr/sbin/storcli",
                       "/usr/local/sbin/storcli64", "/usr/local/sbin/storcli"]:
                 if os.path.exists(p):
-                    storcli_bin = p
                     print("[SUCCESS] storcli installed at {0}".format(p)); ok = True; break
             if not ok and (run_cmd("which storcli 2>/dev/null") or run_cmd("which storcli64 2>/dev/null")):
                 print("[SUCCESS] storcli installed."); ok = True
-
-            # 创建软链接，确保 storcli64 加入 PATH（/usr/local/sbin）
-            if ok and storcli_bin and not run_cmd("which storcli64 2>/dev/null"):
-                symlink = "/usr/local/sbin/storcli64"
-                try:
-                    if os.path.lexists(symlink):
-                        os.remove(symlink)
-                    os.symlink(storcli_bin, symlink)
-                    print("[INFO] Created symlink: {0} -> {1}".format(symlink, storcli_bin))
-                except Exception as _se:
-                    print("[WARNING] Could not create symlink {0}: {1}".format(symlink, str(_se)))
-
         if not ok:
             msg = "[WARNING] {0}: installation finished but binary not found. Check rpm output above.".format(tool)
             print(msg); COLLECTION_ERRORS.append(msg)
@@ -1016,49 +1001,98 @@ def get_disk_info():
 
             try:
                 data = json.loads(out)
-                # 解析 storcli JSON
+                # storcli JSON 结构（Broadcom 标准格式）:
+                #   "Response Data": {
+                #     "Drive /c0/e252/s0": { "Model": "...", "Size": "...", "Intf": "SAS", "Med": "HDD" },
+                #     "Drive /c0/e252/s0 - Detailed Information": {
+                #       "Drive /c0/e252/s0 Device attributes": { "SN": "...", "Model Number": "..." },
+                #       ...
+                #     }
+                #   }
                 for ctrl in data.get("Controllers", []):
-                    for status in ctrl.get("Response Data", {}).values():
-                        if isinstance(status, list):
-                            for drive in status:
-                                if isinstance(drive, dict) and "Drive Model" in drive and "SN" in drive:
-                                    raw_model = drive.get("Drive Model", "Unknown").strip()
-                                    clean_model = re.sub(r'^(ATA|NVMe)\s+', '', raw_model).strip()
-                                    parts = clean_model.split(None, 1)
-                                    
-                                    raw_sn = drive.get("SN", "Unknown").strip()
-                                    # 华为 2288H 等服务器 storcli 可能将 WWN 误报为 SN，尝试修正
-                                    if _is_wwn(raw_sn):
-                                        # storcli 无法直接给出设备名，只能通过操作系统层枚举后匹配
-                                        # 此处标记为 WWN 以便后续处理
-                                        real_sn = raw_sn  # 先保留原值
-                                        # 通过 /dev/sd* 枚举尝试匹配 WWN 关联的设备
-                                        try:
-                                            import glob
-                                            for blk_dev in sorted(glob.glob("/dev/sd?") + glob.glob("/dev/sd??")):
-                                                udev_out = run_cmd("udevadm info --query=property --name={0} 2>/dev/null".format(blk_dev))
-                                                if udev_out:
-                                                    wwn_m = re.search(r'^ID_WWN=0x([0-9a-fA-F]+)$', udev_out, re.MULTILINE)
-                                                    wwn_cand = wwn_m.group(1).strip().lower() if wwn_m else ""
-                                                    sn_strip = raw_sn.strip().lower().lstrip("0x")
-                                                    if wwn_cand and (sn_strip == wwn_cand or sn_strip in wwn_cand or wwn_cand in sn_strip):
-                                                        real_sn = _get_real_disk_sn(blk_dev, raw_sn)
-                                                        break
-                                        except Exception:
-                                            pass
-                                    else:
-                                        real_sn = raw_sn
-                                    
-                                    disks.append({
-                                        "manufacturer": parts[0] if len(parts) > 1 else "Unknown",
-                                        "model": parts[1] if len(parts) > 1 else clean_model,
-                                        "serial_number": real_sn,
-                                        "size": drive.get("Size", "Unknown"),
-                                        "type": drive.get("Med", "Unknown") + " / " + drive.get("Intf", "Unknown"),
-                                        "provider": "LSI-storcli"
-                                    })
-            except Exception:
-                pass
+                    resp = ctrl.get("Response Data", {})
+                    # 第一步：收集基本条目 和 Detailed 条目
+                    basics  = {}   # "Drive /cX/eY/sZ" -> dict
+                    details = {}   # "Drive /cX/eY/sZ" -> detail dict
+                    for rkey, rval in resp.items():
+                        if not isinstance(rval, dict):
+                            continue
+                        m_basic  = re.match(r'^(Drive /c\d+/e\d+/s\d+)$', rkey)
+                        m_detail = re.match(r'^(Drive /c\d+/e\d+/s\d+) - Detailed Information$', rkey)
+                        if m_basic:
+                            basics[m_basic.group(1)] = rval
+                        elif m_detail:
+                            details[m_detail.group(1)] = rval
+
+                    # 第二步：合并基本+详细信息
+                    for drive_key, basic in basics.items():
+                        model_raw = basic.get("Model", "").strip()
+                        size_raw  = basic.get("Size",  "Unknown").strip()
+                        intf      = basic.get("Intf",  "").strip()
+                        med       = basic.get("Med",   "").strip()
+
+                        # 从 Detailed Information 里找 SN
+                        sn = "Unknown"
+                        for dsval in details.get(drive_key, {}).values():
+                            if isinstance(dsval, dict):
+                                candidate = dsval.get("SN", "") or dsval.get("Serial Number", "")
+                                if candidate:
+                                    sn = str(candidate).strip()
+                                    break
+
+                        if not model_raw and sn == "Unknown":
+                            continue
+
+                        # 如果 SN 是 WWN，尝试通过 udevadm 匹配真实 SN
+                        if _is_wwn(sn):
+                            try:
+                                import glob as _glob
+                                for blk_dev in sorted(_glob.glob("/dev/sd?") + _glob.glob("/dev/sd??")):
+                                    udev_out = run_cmd("udevadm info --query=property --name={0} 2>/dev/null".format(blk_dev))
+                                    if udev_out:
+                                        wwn_m = re.search(r'^ID_WWN=0x([0-9a-fA-F]+)$', udev_out, re.MULTILINE)
+                                        wwn_cand = wwn_m.group(1).lower() if wwn_m else ""
+                                        sn_strip = sn.lower().lstrip("0x")
+                                        if wwn_cand and (sn_strip == wwn_cand or sn_strip in wwn_cand or wwn_cand in sn_strip):
+                                            sn = _get_real_disk_sn(blk_dev, sn)
+                                            break
+                            except Exception:
+                                pass
+
+                        # 拆分厂商 + 型号
+                        clean_model = re.sub(r'^(ATA|NVMe|SATA)\s+', '', model_raw).strip()
+                        parts = clean_model.split(None, 1)
+                        manufacturer = parts[0] if len(parts) > 1 else "Unknown"
+                        model        = parts[1] if len(parts) > 1 else clean_model
+
+                        # 标准化厂商名
+                        mup = manufacturer.upper()
+                        mf  = clean_model.upper()
+                        if "SEAGATE" in mup or mf.startswith("ST"):   manufacturer = "Seagate"
+                        elif mup.startswith("WD") or "WESTERN" in mup: manufacturer = "Western Digital"
+                        elif "TOSHIBA" in mup: manufacturer = "Toshiba"
+                        elif "HGST" in mup:    manufacturer = "HGST"
+                        elif "SAMSUNG" in mup or mf.startswith("MZ"): manufacturer = "Samsung"
+                        elif "MICRON" in mup or mf.startswith("MT"):  manufacturer = "Micron"
+                        elif "INTEL" in mup:   manufacturer = "Intel"
+                        elif "KIOXIA" in mup:  manufacturer = "KIOXIA"
+                        elif "SSSTC" in mup:   manufacturer = "SSSTC"
+
+                        disk_type = "Unknown"
+                        if "ssd" in med.lower() or "flash" in med.lower(): disk_type = "SSD"
+                        elif "hdd" in med.lower() or "disk" in med.lower(): disk_type = "HDD"
+
+                        disks.append({
+                            "manufacturer":  manufacturer,
+                            "model":         model,
+                            "serial_number": sn,
+                            "size":          size_raw,
+                            "type":          disk_type,
+                            "interface":     intf,
+                            "provider":      "LSI-storcli"
+                        })
+            except Exception as _je:
+                print("[WARNING] storcli JSON parse error: {0}".format(str(_je)))
         if disks: return disks
 
     # 策略 2: 检查老旧 MegaCli
