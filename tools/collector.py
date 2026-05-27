@@ -71,7 +71,9 @@ def check_and_install_dependencies():
         "ip": "iproute",
         "ethtool": "ethtool",
         "lshw": "lshw",
-        "lspci": "pciutils"
+        "lspci": "pciutils",
+        "smartctl": "smartmontools",
+        "sg_inq": "sg3_utils"
     }
     
     pm = None
@@ -165,16 +167,13 @@ def get_system_info():
         
     return sys_info
 
-def auto_install_raid_tools(sys_info, server_url):
+def auto_install_raid_tools(sys_info, server_url=None):
     """
-    智能去大本营服务端下载闭源探针。
-    根据服务器厂商 + 操作系统类型 + CPU架构，自动匹配对应的 RAID 管理工具并安装。
+    智能安装闭源 RAID 管理工具。
+    安装源优先级:
+      1. 脚本同目录下的 tools/ 子目录（无需 --server 参数）
+      2. 服务端远程下载（需要 --server 参数）
     """
-    if not server_url:
-        return
-        
-    # 提取协议和域名端口 (如 http://192.168.1.1:8080)
-    base_url = "/".join(server_url.split("/")[:3])
     manu = sys_info.get("manufacturer", "").lower()
     
     # ===== 步骤1: 探测操作系统类型和版本 =====
@@ -272,64 +271,135 @@ def auto_install_raid_tools(sys_info, server_url):
                       os.path.exists("/usr/sbin/hpacucli") or \
                       os.path.exists("/opt/hp/ssacli/bld/ssacli") or \
                       os.path.exists("/opt/smartstorageadmin/ssacli/bin/ssacli")
-        if not has_hp_tool: 
+        if not has_hp_tool:
             tools_needed.append(("ssacli", get_ssacli_filename()))
     elif "dell" in manu or "lenovo" in manu or "inspur" in manu or "huawei" in manu or \
          "nettrix" in manu or "sugon" in manu or "h3c" in manu or "great wall" in manu or "dawning" in manu:
-        if not run_cmd("which storcli64 2>/dev/null") and not os.path.exists("/opt/MegaRAID/storcli/storcli64"):
+        # 同时检查 storcli 和 storcli64 两种名称及常见安装路径
+        has_storcli = (
+            run_cmd("which storcli 2>/dev/null")   or
+            run_cmd("which storcli64 2>/dev/null") or
+            os.path.exists("/opt/MegaRAID/storcli/storcli64") or
+            os.path.exists("/opt/MegaRAID/storcli/storcli")  or
+            os.path.exists("/usr/sbin/storcli64") or
+            os.path.exists("/usr/sbin/storcli")
+        )
+        if not has_storcli:
             tools_needed.append(("storcli", get_storcli_filename()))
-            
-    # ===== 步骤4: 下载并安装 =====
-    for tool, actual_filename in tools_needed:
+        else:
+            # 已安装但不在 PATH → 自动补建软链接
+            if not run_cmd("which storcli64 2>/dev/null") and not run_cmd("which storcli 2>/dev/null"):
+                for _bin in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
+                             "/usr/sbin/storcli64", "/usr/sbin/storcli"]:
+                    if os.path.exists(_bin):
+                        _sym = "/usr/local/sbin/" + os.path.basename(_bin)
+                        try:
+                            if os.path.lexists(_sym): os.remove(_sym)
+                            os.symlink(_bin, _sym)
+                            print("[INFO] storcli already installed; created symlink: {0} -> {1}".format(_sym, _bin))
+                        except Exception as _se:
+                            print("[WARNING] Could not create symlink: {0}".format(str(_se)))
+                        break
+
+    print("[DEBUG] Manufacturer detected: '{0}'".format(manu))
+    if not tools_needed:
+        print("[DEBUG] No RAID tools needed (already installed or unsupported vendor).")
+        return
+
+    # ===== 步骤4: 内部安装+验证函数 =====
+    def _install_pkg(pkg_path, tool):
+        """直接调用 rpm/dpkg，不经过 run_cmd（run_cmd 在 returncode!=0 时不返回任何内容）"""
+        print("[INFO] Installing {0} from {1} ...".format(tool, pkg_path))
+        try:
+            if is_rpm:
+                ret = subprocess.call(
+                    ["rpm", "-ivh", "--force", pkg_path],
+                    stdout=sys.stdout, stderr=sys.stderr
+                )
+            elif is_dpkg:
+                env = os.environ.copy()
+                env["DEBIAN_FRONTEND"] = "noninteractive"
+                ret = subprocess.call(
+                    ["dpkg", "-i", pkg_path],
+                    stdout=sys.stdout, stderr=sys.stderr, env=env
+                )
+            else:
+                ret = -1
+            print("[INFO] Package manager exited with code: {0}".format(ret))
+        except Exception as ex:
+            print("[ERROR] Failed to run package manager: {0}".format(str(ex)))
+
+        # 验证安装结果
+        ok = False
+        if tool == "ssacli":
+            for p in ["/usr/sbin/ssacli", "/opt/hp/ssacli/bld/ssacli",
+                      "/opt/smartstorageadmin/ssacli/bin/ssacli"]:
+                if os.path.exists(p):
+                    print("[SUCCESS] ssacli installed at {0}".format(p)); ok = True; break
+            if not ok and run_cmd("which ssacli 2>/dev/null"):
+                print("[SUCCESS] ssacli installed."); ok = True
+        elif tool == "storcli":
+            for p in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
+                      "/usr/sbin/storcli64", "/usr/sbin/storcli",
+                      "/usr/local/sbin/storcli64", "/usr/local/sbin/storcli"]:
+                if os.path.exists(p):
+                    print("[SUCCESS] storcli installed at {0}".format(p)); ok = True; break
+            if not ok and (run_cmd("which storcli 2>/dev/null") or run_cmd("which storcli64 2>/dev/null")):
+                print("[SUCCESS] storcli installed."); ok = True
+        if not ok:
+            msg = "[WARNING] {0}: installation finished but binary not found. Check rpm output above.".format(tool)
+            print(msg); COLLECTION_ERRORS.append(msg)
+        return ok
+
+    # ===== 步骤5: 优先本地 tools/ 目录 =====
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    local_search = [
+        os.path.join(script_dir, "tools"),
+        os.path.join(os.getcwd(), "tools"),
+    ]
+    still_needed = []
+    for tool, filename in tools_needed:
+        found_local = False
+        for d in local_search:
+            p = os.path.join(d, filename)
+            if os.path.isfile(p):
+                print("[INFO] Found local package: {0}".format(p))
+                _install_pkg(p, tool)
+                found_local = True
+                break
+        if not found_local:
+            still_needed.append((tool, filename))
+
+    # ===== 步骤6: 本地没有再尝试远程下载 =====
+    if not still_needed or not server_url:
+        return
+
+    base_url = "/".join(server_url.split("/")[:3])
+    for tool, actual_filename in still_needed:
         download_url = "{0}/tools/{1}".format(base_url, actual_filename)
         tmp_file = "/tmp/{0}".format(actual_filename)
-        print("[INFO] Attempting to auto-download proprietary RAID tool: {0} ...".format(download_url))
+        print("[INFO] Attempting to download: {0} ...".format(download_url))
         
-        # 使用内建下载器
         try:
             req = urllib_request.urlopen(download_url, timeout=30)
-            if req.getcode() == 200:
+            code = req.getcode()
+            print("[DEBUG] HTTP {0} for {1}".format(code, download_url))
+            if code == 200:
+                data = req.read()
+                print("[INFO] Downloaded {0} bytes. Writing to {1} ...".format(len(data), tmp_file))
                 with open(tmp_file, "wb") as f:
-                    f.write(req.read())
-                
-                print("[INFO] Downloaded {0}. Installing...".format(tmp_file))
-                if is_rpm:
-                    run_cmd("rpm -ivh {0}".format(tmp_file))
-                elif is_dpkg:
-                    run_cmd("DEBIAN_FRONTEND=noninteractive dpkg -i {0}".format(tmp_file))
-                
-                # 安装后验证工具是否可用
-                installed = False
-                if tool == "ssacli":
-                    for check_path in ["/usr/sbin/ssacli", "/opt/hp/ssacli/bld/ssacli", "/opt/smartstorageadmin/ssacli/bin/ssacli"]:
-                        if os.path.exists(check_path):
-                            print("[SUCCESS] {0} installed at {1}".format(tool, check_path))
-                            installed = True
-                            break
-                    if not installed and run_cmd("which ssacli 2>/dev/null"):
-                        print("[SUCCESS] {0} installed successfully.".format(tool))
-                        installed = True
-                elif tool == "storcli":
-                    if run_cmd("which storcli64 2>/dev/null") or os.path.exists("/opt/MegaRAID/storcli/storcli64"):
-                        print("[SUCCESS] {0} installed successfully.".format(tool))
-                        installed = True
-                
-                if not installed:
-                    msg = "[WARNING] {0} installation completed but binary not found in expected paths.".format(tool)
-                    print(msg)
-                    COLLECTION_ERRORS.append(msg)
-                    
-                # 删除临时文件
+                    f.write(data)
+                _install_pkg(tmp_file, tool)
                 try:
                     os.remove(tmp_file)
                 except:
                     pass
             else:
-                msg = "[ERROR] File not found on server repo: {0}".format(download_url)
+                msg = "[ERROR] File not found on server: {0}".format(download_url)
                 print(msg)
                 COLLECTION_ERRORS.append(msg)
         except Exception as e:
-            msg = "[ERROR] Failed to fetch tool from server: {0}".format(str(e))
+            msg = "[ERROR] Failed to fetch from server: {0} => {1}".format(download_url, str(e))
             print(msg)
             COLLECTION_ERRORS.append(msg)
 
@@ -647,42 +717,394 @@ def get_network_info():
                     current_name = None
     return net_list
 
+def _is_wwn(sn):
+    """
+    判断给定字符串是否为 WWN/NAA 标识符，而非真实磁盘序列号。
+    - NAA-5 (SAS 物理盘 WWN):   16 位纯十六进制 (8 字节)
+    - NAA-6 (RAID 控制器 LUN): 32 位纯十六进制 (16 字节)
+    真实 SN 一般为 8-16 位字母数字混合，通常包含字母且不全是 0-9a-f。
+    """
+    if not sn or sn in ["Unknown", ""]:
+        return False
+    s = sn.strip().lower().lstrip("0x")
+    # 14~32 位纯十六进制字符 → 判定为 WWN/NAA 标识符
+    if re.match(r'^[0-9a-f]{14,32}$', s):
+        return True
+    return False
+
+
+def _get_real_disk_sn(dev_name, sn_candidate):
+    """
+    当检测到 sn_candidate 可能是 WWN 时，尝试通过多种途径获取磁盘真实序列号。
+    
+    优先级（从零依赖到有依赖）:
+      0. sysfs VPD pg80 二进制文件 (内核直接暴露，无需任何工具)
+      1. sysfs /sys/block/sdX/device/serial (内核 SCSI 层缓存)
+      2. udevadm info ID_SERIAL_SHORT
+      3. smartctl -i
+      4. sg_inq --page=0x80
+    
+    :param dev_name: 磁盘设备名，如 'sda' 或 '/dev/sda'
+    :param sn_candidate: 当前已有的 SN（可能是 WWN）
+    :return: 真实 SN 字符串，或原始候选值（若无法改善）
+    """
+    if not dev_name:
+        return sn_candidate
+    
+    # 统一设备路径和短名
+    dev_path = dev_name if dev_name.startswith("/dev/") else "/dev/" + dev_name
+    dev_short = dev_name.replace("/dev/", "")
+    
+    # ---- 方法0: 直读内核 sysfs VPD Page 0x80 二进制文件 (零依赖，最可靠) ----
+    # Linux 3.6+ 在 /sys/block/<dev>/device/vpd_pg80 暴露 SCSI Unit Serial Number 页
+    vpd_pg80_path = "/sys/block/{0}/device/vpd_pg80".format(dev_short)
+    if os.path.exists(vpd_pg80_path):
+        try:
+            with open(vpd_pg80_path, "rb") as f:
+                vpd_data = f.read()
+            # VPD pg 0x80 格式: [devtype(1)] [0x80(1)] [length_hi(1)] [length_lo(1)] [sn_ascii...]
+            if len(vpd_data) >= 4 and vpd_data[1:2] in (b'\x80', b'\x00'):
+                pg_len = (vpd_data[2] << 8 | vpd_data[3]) if len(vpd_data) > 3 else 0
+                # 兼容只有 2 字节头的简化实现
+                if pg_len == 0 and len(vpd_data) > 4:
+                    pg_len = len(vpd_data) - 4
+                sn_bytes = vpd_data[4:4 + pg_len] if pg_len > 0 else vpd_data[4:]
+                try:
+                    real_sn = sn_bytes.decode('ascii', 'ignore').strip()
+                except Exception:
+                    real_sn = ""
+                if real_sn and not _is_wwn(real_sn):
+                    return real_sn
+        except Exception:
+            pass
+    
+    # ---- 方法1: sysfs /sys/block/sdX/device/serial (内核 SCSI inquiry 缓存) ----
+    sysfs_serial_path = "/sys/block/{0}/device/serial".format(dev_short)
+    if os.path.exists(sysfs_serial_path):
+        try:
+            with open(sysfs_serial_path, "r") as f:
+                real_sn = f.read().strip()
+            if real_sn and not _is_wwn(real_sn):
+                return real_sn
+        except Exception:
+            pass
+    
+    # ---- 方法2: udevadm info ID_SERIAL_SHORT ----
+    udev_out = run_cmd("udevadm info --query=property --name={0} 2>/dev/null".format(dev_path))
+    if udev_out:
+        m = re.search(r'^ID_SERIAL_SHORT=(.+)$', udev_out, re.MULTILINE)
+        if m:
+            real_sn = m.group(1).strip()
+            if real_sn and not _is_wwn(real_sn):
+                return real_sn
+    
+    # ---- 方法3: smartctl -i (覆盖绝大多数 ATA/SATA/SAS/NVMe 盘) ----
+    smartctl_bin = run_cmd("which smartctl 2>/dev/null").strip()
+    if smartctl_bin:
+        smartctl_out = run_cmd("{0} -i {1} 2>/dev/null".format(smartctl_bin, dev_path))
+        if smartctl_out:
+            m = re.search(r'^Serial Number:\s*(\S+)', smartctl_out, re.MULTILINE | re.IGNORECASE)
+            if m:
+                real_sn = m.group(1).strip()
+                if real_sn and not _is_wwn(real_sn):
+                    return real_sn
+    
+    # ---- 方法4: sg_inq --page=0x80 (专为 SAS/SCSI 设备) ----
+    sginq_bin = run_cmd("which sg_inq 2>/dev/null").strip()
+    if sginq_bin:
+        vpd_out = run_cmd("{0} --page=0x80 {1} 2>/dev/null".format(sginq_bin, dev_path))
+        if vpd_out:
+            m = re.search(r'Unit serial number:\s*(\S+)', vpd_out, re.IGNORECASE)
+            if m:
+                real_sn = m.group(1).strip()
+                if real_sn and not _is_wwn(real_sn):
+                    return real_sn
+    
+    # 所有方法均未能改善，返回原候选值
+    return sn_candidate
+
+def _probe_megaraid_physical_drives(vd_dev_name):
+    """
+    利用 smartctl MegaRAID pass-through 模式，透过 RAID 控制器查询背后的真实物理盘。
+    支持 Broadcom/Avago/LSI MegaRAID 化容控制器（华为 2288H 上常用）。
+    命令示例: smartctl -i -d megaraid,0 /dev/sdf
+
+    :param vd_dev_name: RAID 虚拟盘设备名，如 'sdf' 或 '/dev/sdf'
+    :return: list of physical drive dicts
+    """
+    smartctl_bin = run_cmd("which smartctl 2>/dev/null").strip()
+    if not smartctl_bin:
+        msg = "[WARNING] smartctl not found; cannot probe RAID physical drives via pass-through."
+        print(msg)
+        COLLECTION_ERRORS.append(msg)
+        return []
+
+    dev_path = vd_dev_name if vd_dev_name.startswith("/dev/") else "/dev/" + vd_dev_name
+    found_drives = []
+    consecutive_empty = 0  # 连续空槽位计数
+
+    for slot in range(32):  # MegaRAID 最多支持每控制器 32 块物理盘
+        # 注意: 用 subprocess 同时捕获 stdout+stderr，否则 smartctl 错误信息丢失
+        try:
+            import subprocess as _sp
+            p = _sp.Popen(
+                "{0} -i -d megaraid,{1} {2}".format(smartctl_bin, slot, dev_path),
+                shell=True,
+                stdout=_sp.PIPE, stderr=_sp.STDOUT
+            )
+            raw, _ = p.communicate()
+            try:
+                out = raw.decode("utf-8", "ignore")
+            except AttributeError:
+                out = raw
+        except Exception:
+            break
+
+        out_lower = out.lower()
+
+        # ---- 控制器完全不支持 megaraid pass-through —— 弹出并放弃 ----
+        FATAL_SIGNS = [
+            "no such device",
+            "unable to detect device type",
+            "requires '-d' option",
+            "open failed",
+            "controller not found",
+            "unknown scsi opcode",
+        ]
+        if any(sig in out_lower for sig in FATAL_SIGNS):
+            break
+
+        # ---- 解析关键字段，以是否有 Serial Number 为核心判断 ----
+        sn_m    = re.search(r'^Serial Number:\s*(\S+)',           out, re.MULTILINE | re.IGNORECASE)
+        model_m = re.search(r'^(?:Device Model|Product):\s*(.+)',out, re.MULTILINE | re.IGNORECASE)
+        cap_m   = re.search(r'^User Capacity:\s*(.+)',           out, re.MULTILINE | re.IGNORECASE)
+        rpm_m   = re.search(r'^Rotation Rate:\s*(.+)',           out, re.MULTILINE | re.IGNORECASE)
+
+        if not sn_m:
+            # 没有 SN 说明该槽位为空或不可读
+            consecutive_empty += 1
+            if consecutive_empty >= 4:   # 连续 4 个空槽位则认为已超出范围
+                break
+            continue
+
+        consecutive_empty = 0  # 成功读到一块，重置计数器
+
+        sn        = sn_m.group(1).strip()
+        model_raw = model_m.group(1).strip() if model_m else "Unknown"
+        cap_raw   = cap_m.group(1).strip()   if cap_m   else ""
+        rpm_raw   = rpm_m.group(1).strip()   if rpm_m   else ""
+
+        # 容量解析: 优先从 [X.XX TB] 括号内取，其次从 bytes 计算
+        size_str = "Unknown"
+        bracket_m = re.search(r'\[([^\]]+(?:TB|GB|MB|KB)[^\]]*)\]', cap_raw, re.IGNORECASE)
+        if bracket_m:
+            size_str = bracket_m.group(1).strip()
+        else:
+            bytes_m = re.search(r'([\d,]+)\s+bytes', cap_raw)
+            if bytes_m:
+                try:
+                    bv = int(bytes_m.group(1).replace(",", ""))
+                    if bv >= 1024 ** 4:
+                        size_str = "{0:.2f} TB".format(bv / (1024 ** 4))
+                    elif bv >= 1024 ** 3:
+                        size_str = "{0:.0f} GB".format(bv / (1024 ** 3))
+                    else:
+                        size_str = "{0:.0f} MB".format(bv / (1024 ** 2))
+                except Exception:
+                    pass
+
+        # 磁盘类型
+        disk_type = "Unknown"
+        if rpm_raw:
+            rpm_lower = rpm_raw.lower()
+            if "solid state" in rpm_lower or rpm_raw.strip() == "0":
+                disk_type = "SSD"
+            elif re.search(r'\d+', rpm_raw):
+                disk_type = "HDD"
+
+        # 厂商 + 型号拆分
+        parts = model_raw.split(None, 1)
+        if len(parts) > 1:
+            manufacturer, model = parts[0], parts[1]
+        else:
+            manufacturer, model = "Unknown", model_raw
+
+        mfr_up = manufacturer.upper()
+        mod_up = model_raw.upper()
+        if "SEAGATE" in mfr_up or mod_up.startswith("ST"): manufacturer = "Seagate"
+        elif mfr_up.startswith("WD") or "WESTERN" in mfr_up:  manufacturer = "Western Digital"
+        elif "TOSHIBA" in mfr_up:   manufacturer = "Toshiba"
+        elif "HGST" in mfr_up:      manufacturer = "HGST"
+        elif "SAMSUNG" in mfr_up or mod_up.startswith("MZ"): manufacturer = "Samsung"
+        elif "MICRON" in mfr_up:    manufacturer = "Micron"
+        elif "INTEL" in mfr_up:     manufacturer = "Intel"
+        elif "KIOXIA" in mfr_up:    manufacturer = "KIOXIA"
+
+        found_drives.append({
+            "manufacturer": manufacturer,
+            "model": model,
+            "serial_number": sn,
+            "size": size_str,
+            "type": disk_type,
+            "slot": slot,
+            "provider": "smartctl-megaraid",
+            "via": dev_path
+        })
+
+    return found_drives
+
+
 def get_disk_info():
     """
     智能下钻物理硬盘及其 SN。此环节是跨硬件管理的核心痛点。
+    针对华为 2288H 等服务器，lsblk/storcli 对 SAS 盘返回的 SERIAL
+    可能是 WWN 而非真实制造商序列号，需通过 udevadm/smartctl/sg_inq 修正。
     """
     disks = []
     
-    # 策略 1: 检查是否存在 storcli (针对 LSI/Broadcom/Dell)
-    storcli_path = run_cmd("which storcli 2>/dev/null") or run_cmd("which storcli64 2>/dev/null")
-    if not storcli_path and os.path.exists("/opt/MegaRAID/storcli/storcli64"):
-        storcli_path = "/opt/MegaRAID/storcli/storcli64"
+    # 策略 1: 检查是否存在 storcli (针对 LSI/Broadcom/Dell/Huawei)
+    # 注意：新版 storcli rpm 安装后可能叫 storcli 而非 storcli64
+    storcli_path = (
+        run_cmd("which storcli64 2>/dev/null").strip() or
+        run_cmd("which storcli 2>/dev/null").strip()
+    )
+    if not storcli_path:
+        for _p in [
+            "/opt/MegaRAID/storcli/storcli64",
+            "/opt/MegaRAID/storcli/storcli",
+            "/usr/sbin/storcli64",
+            "/usr/sbin/storcli",
+            "/usr/local/sbin/storcli64",
+            "/usr/local/sbin/storcli",
+        ]:
+            if os.path.exists(_p):
+                storcli_path = _p
+                break
         
     if storcli_path:
-        out = run_cmd(storcli_path + " /c0 /eall /sall show all J")
-        if out:
+        storcli_path = storcli_path.strip()
+        try:
+            # 直接用 Popen 捕获输出，不依赖 returncode（storcli 可能返回非 0 即使成功）
+            _p = subprocess.Popen(
+                [storcli_path, "/call", "/eall", "/sall", "show", "all", "J"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            _stdout, _ = _p.communicate()
             try:
+                out = _stdout.decode("utf-8", "ignore").strip()
+            except AttributeError:
+                out = _stdout.strip()
+        except Exception as _e:
+            out = ""
+            print("[WARNING] storcli execution failed: {0}".format(str(_e)))
+        print("[DEBUG] storcli path={0}, output_len={1}".format(storcli_path, len(out)))
+        if out and out.strip():
+
+            try:
+                # 尝试找到 JSON 开始位置（部分 storcli 版本前面有非 JSON 文字）
+                json_start = out.find('{')
+                if json_start > 0:
+                    out = out[json_start:]
                 data = json.loads(out)
-                # 解析 storcli JSON
+                # storcli JSON 结构（Broadcom 标准格式）:
+                #   "Response Data": {
+                #     "Drive /c0/e252/s0": { "Model": "...", "Size": "...", "Intf": "SAS", "Med": "HDD" },
+                #     "Drive /c0/e252/s0 - Detailed Information": {
+                #       "Drive /c0/e252/s0 Device attributes": { "SN": "...", "Model Number": "..." },
+                #       ...
+                #     }
+                #   }
                 for ctrl in data.get("Controllers", []):
-                    for status in ctrl.get("Response Data", {}).values():
-                        if isinstance(status, list):
-                            for drive in status:
-                                if isinstance(drive, dict) and "Drive Model" in drive and "SN" in drive:
-                                    raw_model = drive.get("Drive Model", "Unknown").strip()
-                                    clean_model = re.sub(r'^(ATA|NVMe)\s+', '', raw_model).strip()
-                                    parts = clean_model.split(None, 1)
-                                    
-                                    disks.append({
-                                        "manufacturer": parts[0] if len(parts) > 1 else "Unknown",
-                                        "model": parts[1] if len(parts) > 1 else clean_model,
-                                        "serial_number": drive.get("SN", "Unknown").strip(),
-                                        "size": drive.get("Size", "Unknown"),
-                                        "type": drive.get("Med", "Unknown") + " / " + drive.get("Intf", "Unknown"),
-                                        "provider": "LSI-storcli"
-                                    })
-            except Exception:
-                pass
+                    resp = ctrl.get("Response Data", {})
+                    _resp_keys = list(resp.keys())
+                    print("[DEBUG] storcli resp keys ({0}): {1}".format(len(_resp_keys), _resp_keys[:10]))
+                    # 第一步：收集基本条目 和 Detailed 条目
+                    basics  = {}   # "Drive /cX/eY/sZ" -> dict
+                    details = {}   # "Drive /cX/eY/sZ" -> detail dict
+                    for rkey, rval in resp.items():
+                        # storcli basic 条目的 value 可能是 list([{...}]) 而非 dict
+                        # 如果是只含一个 dict 的 list，自动解包
+                        if isinstance(rval, list) and len(rval) == 1 and isinstance(rval[0], dict):
+                            rval = rval[0]
+                        if not isinstance(rval, dict):
+                            continue
+                        m_basic  = re.match(r'^(Drive /c\d+/e\d+/s\d+)$', rkey)
+                        m_detail = re.match(r'^(Drive /c\d+/e\d+/s\d+) - Detailed Information$', rkey)
+                        if m_basic:
+                            basics[m_basic.group(1)] = rval
+                        elif m_detail:
+                            details[m_detail.group(1)] = rval
+
+                    print("[DEBUG] storcli basics={0}, details={1}".format(len(basics),len(details)))
+                    # 第二步：合并基本+详细信息
+                    for drive_key, basic in basics.items():
+                        model_raw = basic.get("Model", "").strip()
+                        size_raw  = basic.get("Size",  "Unknown").strip()
+                        intf      = basic.get("Intf",  "").strip()
+                        med       = basic.get("Med",   "").strip()
+
+                        # 从 Detailed Information 里找 SN
+                        sn = "Unknown"
+                        for dsval in details.get(drive_key, {}).values():
+                            if isinstance(dsval, dict):
+                                candidate = dsval.get("SN", "") or dsval.get("Serial Number", "")
+                                if candidate:
+                                    sn = str(candidate).strip()
+                                    break
+
+                        if not model_raw and sn == "Unknown":
+                            continue
+
+                        # 如果 SN 是 WWN，尝试通过 udevadm 匹配真实 SN
+                        if _is_wwn(sn):
+                            try:
+                                import glob as _glob
+                                for blk_dev in sorted(_glob.glob("/dev/sd?") + _glob.glob("/dev/sd??")):
+                                    udev_out = run_cmd("udevadm info --query=property --name={0} 2>/dev/null".format(blk_dev))
+                                    if udev_out:
+                                        wwn_m = re.search(r'^ID_WWN=0x([0-9a-fA-F]+)$', udev_out, re.MULTILINE)
+                                        wwn_cand = wwn_m.group(1).lower() if wwn_m else ""
+                                        sn_strip = sn.lower().lstrip("0x")
+                                        if wwn_cand and (sn_strip == wwn_cand or sn_strip in wwn_cand or wwn_cand in sn_strip):
+                                            sn = _get_real_disk_sn(blk_dev, sn)
+                                            break
+                            except Exception:
+                                pass
+
+                        # 拆分厂商 + 型号
+                        clean_model = re.sub(r'^(ATA|NVMe|SATA)\s+', '', model_raw).strip()
+                        parts = clean_model.split(None, 1)
+                        manufacturer = parts[0] if len(parts) > 1 else "Unknown"
+                        model        = parts[1] if len(parts) > 1 else clean_model
+
+                        # 标准化厂商名
+                        mup = manufacturer.upper()
+                        mf  = clean_model.upper()
+                        if "SEAGATE" in mup or mf.startswith("ST"):   manufacturer = "Seagate"
+                        elif mup.startswith("WD") or "WESTERN" in mup: manufacturer = "Western Digital"
+                        elif "TOSHIBA" in mup: manufacturer = "Toshiba"
+                        elif "HGST" in mup:    manufacturer = "HGST"
+                        elif "SAMSUNG" in mup or mf.startswith("MZ"): manufacturer = "Samsung"
+                        elif "MICRON" in mup or mf.startswith("MT"):  manufacturer = "Micron"
+                        elif "INTEL" in mup:   manufacturer = "Intel"
+                        elif "KIOXIA" in mup:  manufacturer = "KIOXIA"
+                        elif "SSSTC" in mup:   manufacturer = "SSSTC"
+
+                        disk_type = "Unknown"
+                        if "ssd" in med.lower() or "flash" in med.lower(): disk_type = "SSD"
+                        elif "hdd" in med.lower() or "disk" in med.lower(): disk_type = "HDD"
+
+                        disks.append({
+                            "manufacturer":  manufacturer,
+                            "model":         model,
+                            "serial_number": sn,
+                            "size":          size_raw,
+                            "type":          disk_type,
+                            "interface":     intf,
+                            "provider":      "LSI-storcli"
+                        })
+            except Exception as _je:
+                print("[WARNING] storcli JSON parse error: {0}".format(str(_je)))
         if disks: return disks
 
     # 策略 2: 检查老旧 MegaCli
@@ -858,8 +1280,14 @@ def get_disk_info():
                 if rota is not None:
                     disk_type = "HDD" if (rota == True or rota == 1 or str(rota) == "1") else "SSD"
                 
+                # 华为 2288H 等服务器的 SAS 磁盘，lsblk SERIAL 字段可能返回 WWN
+                # 需通过 udevadm/smartctl/sg_inq 获取真实制造商序列号
+                dev_name_str = dev.get("name", "")
+                if _is_wwn(serial) and dev_name_str:
+                    serial = _get_real_disk_sn(dev_name_str, serial)
+                
                 disks.append({
-                    "name": dev.get("name", "?"),
+                    "name": dev_name_str or "?",
                     "manufacturer": manufacturer,
                     "model": model,
                     "serial_number": serial,
@@ -898,8 +1326,13 @@ def get_disk_info():
                     manufacturer = m_parts[0]
                     model = m_parts[1]
                 
+                # 同样检测并修正 lsblk -P 模式下返回的 WWN
+                dev_name_str = fields.get("NAME", "")
+                if _is_wwn(serial) and dev_name_str:
+                    serial = _get_real_disk_sn(dev_name_str, serial)
+                
                 disks.append({
-                    "name": fields.get("NAME", "?"),
+                    "name": dev_name_str or "?",
                     "manufacturer": manufacturer,
                     "model": model,
                     "serial_number": serial,
@@ -908,7 +1341,50 @@ def get_disk_info():
                     "provider": "OS-lsblk"
                 })
 
-    return disks
+    # ---- RAID 虚拟盘识别并尝试穿透查询物理盘 ----
+    # 识别到 RAID VD 后，将其标记为 is_raid_virtual_drive=True，同时尝试用
+    # smartctl megaraid pass-through 获取背后的物理盘并一并并入列表。
+    # 返回一个普通 list，不改变输出 JSON 结构。
+    RAID_VD_MODEL_KEYWORDS = [
+        "hw-sas", "hw_sas",          # 华为 HW-SAS3408 / HW-SAS3416
+        "avago", "broadcom", "lsi",  # Broadcom/Avago/LSI MegaRAID 控制器
+        "megaraid", "mr",             # LSI MegaRAID 虚拟盘标识
+        "raid", "virtual",
+    ]
+    all_disks = []
+    for d in disks:
+        model_lower = d.get("model", "").lower()
+        sn_val      = d.get("serial_number", "")
+        is_raid_vd  = False
+        # 1. NAA-6 (28位以上hex) → RAID 控制器 LUN，必不是物理盘
+        if _is_wwn(sn_val) and len(sn_val.strip().lower().lstrip("0x")) >= 28:
+            is_raid_vd = True
+        # 2. 型号名含已知 RAID 控制器关键字
+        if not is_raid_vd:
+            for kw in RAID_VD_MODEL_KEYWORDS:
+                if kw in model_lower:
+                    is_raid_vd = True
+                    break
+        if is_raid_vd:
+            d["is_raid_virtual_drive"] = True
+            dev_name = d.get("name", "")
+            # 尝试通过 smartctl megaraid pass-through 穿透查询物理盘
+            probed = _probe_megaraid_physical_drives(dev_name) if dev_name else []
+            if probed:
+                all_disks.extend(probed)  # 先把物理盘放入
+                d["note"] = (
+                    "RAID virtual drive - {0} physical drive(s) found via "
+                    "smartctl megaraid pass-through.".format(len(probed))
+                )
+            else:
+                d["note"] = (
+                    "RAID virtual drive - physical disks behind this controller are not "
+                    "visible to the OS. Install storcli/storcli64 and re-run to enumerate "
+                    "physical drives."
+                )
+        all_disks.append(d)  # RAID VD 本身也保留在列表中，已标记区分
+
+    return all_disks  # 返回普通 list，不改变 JSON 输出结构
 
 def get_gpu_info():
     """
@@ -1036,9 +1512,10 @@ def main():
     print("Collecting System Info...")
     sys_info = get_system_info()
     
-    if args.server:
-        print("Checking missing proprietary RAID utilities from server repo...")
-        auto_install_raid_tools(sys_info, args.server)
+    # 无论是否有 --server，始终尝试安装 RAID 工具
+    # 优先本地 tools/，其次远端服务器
+    print("Checking and installing RAID management tools...")
+    auto_install_raid_tools(sys_info, args.server)
 
     print("Collecting CPU Info...")
     cpu_info = get_cpu_info()
