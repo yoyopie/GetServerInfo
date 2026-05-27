@@ -286,6 +286,21 @@ def auto_install_raid_tools(sys_info, server_url=None):
         )
         if not has_storcli:
             tools_needed.append(("storcli", get_storcli_filename()))
+        else:
+            # 已安装但不在 PATH → 自动补建软链接，方便命令行和 which 找到
+            if not run_cmd("which storcli64 2>/dev/null") and not run_cmd("which storcli 2>/dev/null"):
+                for _bin in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
+                             "/usr/sbin/storcli64", "/usr/sbin/storcli"]:
+                    if os.path.exists(_bin):
+                        _sym = "/usr/local/sbin/" + os.path.basename(_bin)
+                        try:
+                            if os.path.lexists(_sym):
+                                os.remove(_sym)
+                            os.symlink(_bin, _sym)
+                            print("[INFO] storcli already installed; created symlink: {0} -> {1}".format(_sym, _bin))
+                        except Exception as _se:
+                            print("[WARNING] Could not create symlink: {0}".format(str(_se)))
+                        break
 
     print("[DEBUG] Manufacturer detected: '{0}'".format(manu))
     if not tools_needed:
@@ -325,13 +340,27 @@ def auto_install_raid_tools(sys_info, server_url=None):
             if not ok and run_cmd("which ssacli 2>/dev/null"):
                 print("[SUCCESS] ssacli installed."); ok = True
         elif tool == "storcli":
+            storcli_bin = None
             for p in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
                       "/usr/sbin/storcli64", "/usr/sbin/storcli",
                       "/usr/local/sbin/storcli64", "/usr/local/sbin/storcli"]:
                 if os.path.exists(p):
+                    storcli_bin = p
                     print("[SUCCESS] storcli installed at {0}".format(p)); ok = True; break
             if not ok and (run_cmd("which storcli 2>/dev/null") or run_cmd("which storcli64 2>/dev/null")):
                 print("[SUCCESS] storcli installed."); ok = True
+
+            # 创建软链接，确保 storcli64 加入 PATH（/usr/local/sbin）
+            if ok and storcli_bin and not run_cmd("which storcli64 2>/dev/null"):
+                symlink = "/usr/local/sbin/storcli64"
+                try:
+                    if os.path.lexists(symlink):
+                        os.remove(symlink)
+                    os.symlink(storcli_bin, symlink)
+                    print("[INFO] Created symlink: {0} -> {1}".format(symlink, storcli_bin))
+                except Exception as _se:
+                    print("[WARNING] Could not create symlink {0}: {1}".format(symlink, str(_se)))
+
         if not ok:
             msg = "[WARNING] {0}: installation finished but binary not found. Check rpm output above.".format(tool)
             print(msg); COLLECTION_ERRORS.append(msg)
