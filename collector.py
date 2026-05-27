@@ -1011,6 +1011,8 @@ def get_disk_info():
                 #   }
                 for ctrl in data.get("Controllers", []):
                     resp = ctrl.get("Response Data", {})
+                    _resp_keys = list(resp.keys())
+                    print("[DEBUG] storcli resp keys ({0}): {1}".format(len(_resp_keys), _resp_keys[:10]))
                     # 第一步：收集基本条目 和 Detailed 条目
                     basics  = {}   # "Drive /cX/eY/sZ" -> dict
                     details = {}   # "Drive /cX/eY/sZ" -> detail dict
@@ -1024,6 +1026,7 @@ def get_disk_info():
                         elif m_detail:
                             details[m_detail.group(1)] = rval
 
+                    print("[DEBUG] storcli basics={0}, details={1}".format(len(basics),len(details)))
                     # 第二步：合并基本+详细信息
                     for drive_key, basic in basics.items():
                         model_raw = basic.get("Model", "").strip()
