@@ -287,17 +287,35 @@ def auto_install_raid_tools(sys_info, server_url=None):
         if not has_storcli:
             tools_needed.append(("storcli", get_storcli_filename()))
 
+    print("[DEBUG] Manufacturer detected: '{0}'".format(manu))
     if not tools_needed:
+        print("[DEBUG] No RAID tools needed (already installed or unsupported vendor).")
         return
 
     # ===== 步骤4: 内部安装+验证函数 =====
     def _install_pkg(pkg_path, tool):
+        """直接调用 rpm/dpkg，不经过 run_cmd（run_cmd 在 returncode!=0 时不返回任何内容）"""
         print("[INFO] Installing {0} from {1} ...".format(tool, pkg_path))
-        if is_rpm:
-            run_cmd("rpm -ivh --force {0} 2>&1".format(pkg_path))
-        elif is_dpkg:
-            run_cmd("DEBIAN_FRONTEND=noninteractive dpkg -i {0} 2>&1".format(pkg_path))
-        # 验证
+        try:
+            if is_rpm:
+                ret = subprocess.call(
+                    ["rpm", "-ivh", "--force", pkg_path],
+                    stdout=sys.stdout, stderr=sys.stderr
+                )
+            elif is_dpkg:
+                env = os.environ.copy()
+                env["DEBIAN_FRONTEND"] = "noninteractive"
+                ret = subprocess.call(
+                    ["dpkg", "-i", pkg_path],
+                    stdout=sys.stdout, stderr=sys.stderr, env=env
+                )
+            else:
+                ret = -1
+            print("[INFO] Package manager exited with code: {0}".format(ret))
+        except Exception as ex:
+            print("[ERROR] Failed to run package manager: {0}".format(str(ex)))
+
+        # 验证安装结果
         ok = False
         if tool == "ssacli":
             for p in ["/usr/sbin/ssacli", "/opt/hp/ssacli/bld/ssacli",
@@ -308,13 +326,14 @@ def auto_install_raid_tools(sys_info, server_url=None):
                 print("[SUCCESS] ssacli installed."); ok = True
         elif tool == "storcli":
             for p in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
-                      "/usr/sbin/storcli64", "/usr/sbin/storcli"]:
+                      "/usr/sbin/storcli64", "/usr/sbin/storcli",
+                      "/usr/local/sbin/storcli64", "/usr/local/sbin/storcli"]:
                 if os.path.exists(p):
                     print("[SUCCESS] storcli installed at {0}".format(p)); ok = True; break
             if not ok and (run_cmd("which storcli 2>/dev/null") or run_cmd("which storcli64 2>/dev/null")):
                 print("[SUCCESS] storcli installed."); ok = True
         if not ok:
-            msg = "[WARNING] {0}: installed but binary not found in known paths.".format(tool)
+            msg = "[WARNING] {0}: installation finished but binary not found. Check rpm output above.".format(tool)
             print(msg); COLLECTION_ERRORS.append(msg)
         return ok
 
@@ -349,9 +368,13 @@ def auto_install_raid_tools(sys_info, server_url=None):
         
         try:
             req = urllib_request.urlopen(download_url, timeout=30)
-            if req.getcode() == 200:
+            code = req.getcode()
+            print("[DEBUG] HTTP {0} for {1}".format(code, download_url))
+            if code == 200:
+                data = req.read()
+                print("[INFO] Downloaded {0} bytes. Writing to {1} ...".format(len(data), tmp_file))
                 with open(tmp_file, "wb") as f:
-                    f.write(req.read())
+                    f.write(data)
                 _install_pkg(tmp_file, tool)
                 try:
                     os.remove(tmp_file)
@@ -362,7 +385,7 @@ def auto_install_raid_tools(sys_info, server_url=None):
                 print(msg)
                 COLLECTION_ERRORS.append(msg)
         except Exception as e:
-            msg = "[ERROR] Failed to fetch from server: {0}".format(str(e))
+            msg = "[ERROR] Failed to fetch from server: {0} => {1}".format(download_url, str(e))
             print(msg)
             COLLECTION_ERRORS.append(msg)
 
