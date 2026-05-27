@@ -758,7 +758,7 @@ def _get_real_disk_sn(dev_name, sn_candidate):
 def _probe_megaraid_physical_drives(vd_dev_name):
     """
     利用 smartctl MegaRAID pass-through 模式，透过 RAID 控制器查询背后的真实物理盘。
-    支持 Broadcom/Avago/LSI MegaRAID 兴容控制器（华为 2288H 上常用）。
+    支持 Broadcom/Avago/LSI MegaRAID 化容控制器（华为 2288H 上常用）。
     命令示例: smartctl -i -d megaraid,0 /dev/sdf
 
     :param vd_dev_name: RAID 虚拟盘设备名，如 'sdf' 或 '/dev/sdf'
@@ -766,51 +766,60 @@ def _probe_megaraid_physical_drives(vd_dev_name):
     """
     smartctl_bin = run_cmd("which smartctl 2>/dev/null").strip()
     if not smartctl_bin:
+        msg = "[WARNING] smartctl not found; cannot probe RAID physical drives via pass-through."
+        print(msg)
+        COLLECTION_ERRORS.append(msg)
         return []
 
     dev_path = vd_dev_name if vd_dev_name.startswith("/dev/") else "/dev/" + vd_dev_name
     found_drives = []
-    consecutive_failures = 0
+    consecutive_empty = 0  # 连续空槽位计数
 
     for slot in range(32):  # MegaRAID 最多支持每控制器 32 块物理盘
-        out = run_cmd("{0} -i -d megaraid,{1} {2} 2>/dev/null".format(
-            smartctl_bin, slot, dev_path))
-
-        # 无输出或控制器明确不支持
-        if not out:
-            consecutive_failures += 1
-            if consecutive_failures >= 3:
-                break
-            continue
-
-        out_lower = out.lower()
-        # 控制器不支持 megaraid pass-through → 完全放弃
-        if ("no such device" in out_lower or
-                "unable to detect" in out_lower or
-                "requires '-d' option" in out_lower or
-                "open failed" in out_lower):
+        # 注意: 用 subprocess 同时捕获 stdout+stderr，否则 smartctl 错误信息丢失
+        try:
+            import subprocess as _sp
+            p = _sp.Popen(
+                "{0} -i -d megaraid,{1} {2}".format(smartctl_bin, slot, dev_path),
+                shell=True,
+                stdout=_sp.PIPE, stderr=_sp.STDOUT
+            )
+            raw, _ = p.communicate()
+            try:
+                out = raw.decode("utf-8", "ignore")
+            except AttributeError:
+                out = raw
+        except Exception:
             break
 
-        # 该槽位没有磁盘插入
-        if "device does not support" in out_lower or "failed" in out_lower:
-            consecutive_failures += 1
-            if consecutive_failures >= 3:
-                break
-            continue
+        out_lower = out.lower()
 
-        # 解析磁盘信息
-        sn_m    = re.search(r'^Serial Number:\s*(\S+)',    out, re.MULTILINE | re.IGNORECASE)
-        model_m = re.search(r'^(?:Device Model|Product):\s*(.+)', out, re.MULTILINE | re.IGNORECASE)
-        cap_m   = re.search(r'^User Capacity:\s*(.+)',    out, re.MULTILINE | re.IGNORECASE)
-        rpm_m   = re.search(r'^Rotation Rate:\s*(.+)',    out, re.MULTILINE | re.IGNORECASE)
+        # ---- 控制器完全不支持 megaraid pass-through —— 弹出并放弃 ----
+        FATAL_SIGNS = [
+            "no such device",
+            "unable to detect device type",
+            "requires '-d' option",
+            "open failed",
+            "controller not found",
+            "unknown scsi opcode",
+        ]
+        if any(sig in out_lower for sig in FATAL_SIGNS):
+            break
+
+        # ---- 解析关键字段，以是否有 Serial Number 为核心判断 ----
+        sn_m    = re.search(r'^Serial Number:\s*(\S+)',           out, re.MULTILINE | re.IGNORECASE)
+        model_m = re.search(r'^(?:Device Model|Product):\s*(.+)',out, re.MULTILINE | re.IGNORECASE)
+        cap_m   = re.search(r'^User Capacity:\s*(.+)',           out, re.MULTILINE | re.IGNORECASE)
+        rpm_m   = re.search(r'^Rotation Rate:\s*(.+)',           out, re.MULTILINE | re.IGNORECASE)
 
         if not sn_m:
-            consecutive_failures += 1
-            if consecutive_failures >= 3:
+            # 没有 SN 说明该槽位为空或不可读
+            consecutive_empty += 1
+            if consecutive_empty >= 4:   # 连续 4 个空槽位则认为已超出范围
                 break
             continue
 
-        consecutive_failures = 0  # 成功读到一块，重置计数器
+        consecutive_empty = 0  # 成功读到一块，重置计数器
 
         sn        = sn_m.group(1).strip()
         model_raw = model_m.group(1).strip() if model_m else "Unknown"
@@ -1175,15 +1184,16 @@ def get_disk_info():
                 })
 
     # ---- RAID 虚拟盘识别并尝试穿透查询物理盘 ----
-    # 已知 RAID 控制器在 OS 层面呈现的逻辑卷特征
+    # 识别到 RAID VD 后，将其标记为 is_raid_virtual_drive=True，同时尝试用
+    # smartctl megaraid pass-through 获取背后的物理盘并一并并入列表。
+    # 返回一个普通 list，不改变输出 JSON 结构。
     RAID_VD_MODEL_KEYWORDS = [
         "hw-sas", "hw_sas",          # 华为 HW-SAS3408 / HW-SAS3416
         "avago", "broadcom", "lsi",  # Broadcom/Avago/LSI MegaRAID 控制器
         "megaraid", "mr",             # LSI MegaRAID 虚拟盘标识
         "raid", "virtual",
     ]
-    physical = []
-    raid_vd  = []
+    all_disks = []
     for d in disks:
         model_lower = d.get("model", "").lower()
         sn_val      = d.get("serial_number", "")
@@ -1198,13 +1208,14 @@ def get_disk_info():
                     is_raid_vd = True
                     break
         if is_raid_vd:
+            d["is_raid_virtual_drive"] = True
             dev_name = d.get("name", "")
             # 尝试通过 smartctl megaraid pass-through 穿透查询物理盘
             probed = _probe_megaraid_physical_drives(dev_name) if dev_name else []
             if probed:
-                physical.extend(probed)
+                all_disks.extend(probed)  # 先把物理盘放入
                 d["note"] = (
-                    "RAID virtual drive - {0} physical drive(s) detected via "
+                    "RAID virtual drive - {0} physical drive(s) found via "
                     "smartctl megaraid pass-through.".format(len(probed))
                 )
             else:
@@ -1213,11 +1224,9 @@ def get_disk_info():
                     "visible to the OS. Install storcli/storcli64 and re-run to enumerate "
                     "physical drives."
                 )
-            raid_vd.append(d)
-        else:
-            physical.append(d)
+        all_disks.append(d)  # RAID VD 本身也保留在列表中，已标记区分
 
-    return {"physical_disks": physical, "raid_virtual_drives": raid_vd}
+    return all_disks  # 返回普通 list，不改变 JSON 输出结构
 
 def get_gpu_info():
     """
@@ -1359,12 +1368,7 @@ def main():
     network_info = get_network_info()
     
     print("Collecting Disk Info (Detecting RAID Controllers)...")
-    disk_result   = get_disk_info()
-    disk_info     = disk_result["physical_disks"]
-    raid_vd_info  = disk_result["raid_virtual_drives"]
-    if raid_vd_info:
-        print("[INFO] Detected {0} RAID virtual drive(s). Physical drives behind RAID controller "
-              "require storcli to enumerate.".format(len(raid_vd_info)))
+    disk_info = get_disk_info()
     
     print("Collecting GPU Info...")
     gpu_info = get_gpu_info()
@@ -1375,7 +1379,6 @@ def main():
         "memory_modules": memory_info,
         "network_interfaces": network_info,
         "physical_disks": disk_info,
-        "raid_virtual_drives": raid_vd_info,
         "gpu_devices": gpu_info,
         "errors": COLLECTION_ERRORS
     }
