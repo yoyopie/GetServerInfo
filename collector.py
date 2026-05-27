@@ -770,7 +770,7 @@ def get_disk_info():
         storcli_path = "/opt/MegaRAID/storcli/storcli64"
         
     if storcli_path:
-        out = run_cmd(storcli_path + " /c0 /eall /sall show all J")
+        out = run_cmd(storcli_path + " /call /eall /sall show all J")
         if out:
             try:
                 data = json.loads(out)
@@ -1053,7 +1053,36 @@ def get_disk_info():
                     "provider": "OS-lsblk"
                 })
 
-    return disks
+    # ---- RAID 虚拟盘识别 ----
+    # 已知 RAID 控制器在 OS 层面呈现的逻辑卷特征（型号含控制器芯片名）：
+    # HW-SAS3408 / HW-SAS3416 (华为), MR (LSI MegaRAID VD), etc.
+    RAID_VD_MODEL_KEYWORDS = [
+        "hw-sas", "hw_sas", "megaraid", "raid", "virtual",
+    ]
+    # 额外判断：NAA-6 (32位hex) 一定是 RAID 控制器 LUN，绝对不是物理盘
+    physical = []
+    raid_vd  = []
+    for d in disks:
+        model_lower = d.get("model", "").lower()
+        sn_val      = d.get("serial_number", "")
+        is_raid_vd  = False
+        # 1. 32位 NAA-6 LUN ID → RAID 虚拟盘
+        if _is_wwn(sn_val) and len(sn_val.strip().lower().lstrip("0x")) >= 28:
+            is_raid_vd = True
+        # 2. 模型名含已知 RAID 控制器关键字
+        if not is_raid_vd:
+            for kw in RAID_VD_MODEL_KEYWORDS:
+                if kw in model_lower:
+                    is_raid_vd = True
+                    break
+        if is_raid_vd:
+            d["note"] = ("RAID virtual drive - physical disks behind this controller are not visible "
+                         "to the OS. Install storcli/storcli64 and re-run to enumerate physical drives.")
+            raid_vd.append(d)
+        else:
+            physical.append(d)
+
+    return {"physical_disks": physical, "raid_virtual_drives": raid_vd}
 
 def get_gpu_info():
     """
@@ -1195,7 +1224,12 @@ def main():
     network_info = get_network_info()
     
     print("Collecting Disk Info (Detecting RAID Controllers)...")
-    disk_info = get_disk_info()
+    disk_result   = get_disk_info()
+    disk_info     = disk_result["physical_disks"]
+    raid_vd_info  = disk_result["raid_virtual_drives"]
+    if raid_vd_info:
+        print("[INFO] Detected {0} RAID virtual drive(s). Physical drives behind RAID controller "
+              "require storcli to enumerate.".format(len(raid_vd_info)))
     
     print("Collecting GPU Info...")
     gpu_info = get_gpu_info()
@@ -1206,6 +1240,7 @@ def main():
         "memory_modules": memory_info,
         "network_interfaces": network_info,
         "physical_disks": disk_info,
+        "raid_virtual_drives": raid_vd_info,
         "gpu_devices": gpu_info,
         "errors": COLLECTION_ERRORS
     }
