@@ -167,16 +167,13 @@ def get_system_info():
         
     return sys_info
 
-def auto_install_raid_tools(sys_info, server_url):
+def auto_install_raid_tools(sys_info, server_url=None):
     """
-    智能去大本营服务端下载闭源探针。
-    根据服务器厂商 + 操作系统类型 + CPU架构，自动匹配对应的 RAID 管理工具并安装。
+    智能安装闭源 RAID 管理工具。
+    安装源优先级:
+      1. 脚本同目录下的 tools/ 子目录（无需 --server 参数）
+      2. 服务端远程下载（需要 --server 参数）
     """
-    if not server_url:
-        return
-        
-    # 提取协议和域名端口 (如 http://192.168.1.1:8080)
-    base_url = "/".join(server_url.split("/")[:3])
     manu = sys_info.get("manufacturer", "").lower()
     
     # ===== 步骤1: 探测操作系统类型和版本 =====
@@ -274,64 +271,98 @@ def auto_install_raid_tools(sys_info, server_url):
                       os.path.exists("/usr/sbin/hpacucli") or \
                       os.path.exists("/opt/hp/ssacli/bld/ssacli") or \
                       os.path.exists("/opt/smartstorageadmin/ssacli/bin/ssacli")
-        if not has_hp_tool: 
+        if not has_hp_tool:
             tools_needed.append(("ssacli", get_ssacli_filename()))
     elif "dell" in manu or "lenovo" in manu or "inspur" in manu or "huawei" in manu or \
          "nettrix" in manu or "sugon" in manu or "h3c" in manu or "great wall" in manu or "dawning" in manu:
-        if not run_cmd("which storcli64 2>/dev/null") and not os.path.exists("/opt/MegaRAID/storcli/storcli64"):
+        # 同时检查 storcli 和 storcli64 两种名称及常见安装路径
+        has_storcli = (
+            run_cmd("which storcli 2>/dev/null")   or
+            run_cmd("which storcli64 2>/dev/null") or
+            os.path.exists("/opt/MegaRAID/storcli/storcli64") or
+            os.path.exists("/opt/MegaRAID/storcli/storcli")  or
+            os.path.exists("/usr/sbin/storcli64") or
+            os.path.exists("/usr/sbin/storcli")
+        )
+        if not has_storcli:
             tools_needed.append(("storcli", get_storcli_filename()))
-            
-    # ===== 步骤4: 下载并安装 =====
-    for tool, actual_filename in tools_needed:
+
+    if not tools_needed:
+        return
+
+    # ===== 步骤4: 内部安装+验证函数 =====
+    def _install_pkg(pkg_path, tool):
+        print("[INFO] Installing {0} from {1} ...".format(tool, pkg_path))
+        if is_rpm:
+            run_cmd("rpm -ivh --force {0} 2>&1".format(pkg_path))
+        elif is_dpkg:
+            run_cmd("DEBIAN_FRONTEND=noninteractive dpkg -i {0} 2>&1".format(pkg_path))
+        # 验证
+        ok = False
+        if tool == "ssacli":
+            for p in ["/usr/sbin/ssacli", "/opt/hp/ssacli/bld/ssacli",
+                      "/opt/smartstorageadmin/ssacli/bin/ssacli"]:
+                if os.path.exists(p):
+                    print("[SUCCESS] ssacli installed at {0}".format(p)); ok = True; break
+            if not ok and run_cmd("which ssacli 2>/dev/null"):
+                print("[SUCCESS] ssacli installed."); ok = True
+        elif tool == "storcli":
+            for p in ["/opt/MegaRAID/storcli/storcli64", "/opt/MegaRAID/storcli/storcli",
+                      "/usr/sbin/storcli64", "/usr/sbin/storcli"]:
+                if os.path.exists(p):
+                    print("[SUCCESS] storcli installed at {0}".format(p)); ok = True; break
+            if not ok and (run_cmd("which storcli 2>/dev/null") or run_cmd("which storcli64 2>/dev/null")):
+                print("[SUCCESS] storcli installed."); ok = True
+        if not ok:
+            msg = "[WARNING] {0}: installed but binary not found in known paths.".format(tool)
+            print(msg); COLLECTION_ERRORS.append(msg)
+        return ok
+
+    # ===== 步骤5: 优先本地 tools/ 目录 =====
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    local_search = [
+        os.path.join(script_dir, "tools"),
+        os.path.join(os.getcwd(), "tools"),
+    ]
+    still_needed = []
+    for tool, filename in tools_needed:
+        found_local = False
+        for d in local_search:
+            p = os.path.join(d, filename)
+            if os.path.isfile(p):
+                print("[INFO] Found local package: {0}".format(p))
+                _install_pkg(p, tool)
+                found_local = True
+                break
+        if not found_local:
+            still_needed.append((tool, filename))
+
+    # ===== 步骤6: 本地没有再尝试远程下载 =====
+    if not still_needed or not server_url:
+        return
+
+    base_url = "/".join(server_url.split("/")[:3])
+    for tool, actual_filename in still_needed:
         download_url = "{0}/tools/{1}".format(base_url, actual_filename)
         tmp_file = "/tmp/{0}".format(actual_filename)
-        print("[INFO] Attempting to auto-download proprietary RAID tool: {0} ...".format(download_url))
+        print("[INFO] Attempting to download: {0} ...".format(download_url))
         
-        # 使用内建下载器
         try:
             req = urllib_request.urlopen(download_url, timeout=30)
             if req.getcode() == 200:
                 with open(tmp_file, "wb") as f:
                     f.write(req.read())
-                
-                print("[INFO] Downloaded {0}. Installing...".format(tmp_file))
-                if is_rpm:
-                    run_cmd("rpm -ivh {0}".format(tmp_file))
-                elif is_dpkg:
-                    run_cmd("DEBIAN_FRONTEND=noninteractive dpkg -i {0}".format(tmp_file))
-                
-                # 安装后验证工具是否可用
-                installed = False
-                if tool == "ssacli":
-                    for check_path in ["/usr/sbin/ssacli", "/opt/hp/ssacli/bld/ssacli", "/opt/smartstorageadmin/ssacli/bin/ssacli"]:
-                        if os.path.exists(check_path):
-                            print("[SUCCESS] {0} installed at {1}".format(tool, check_path))
-                            installed = True
-                            break
-                    if not installed and run_cmd("which ssacli 2>/dev/null"):
-                        print("[SUCCESS] {0} installed successfully.".format(tool))
-                        installed = True
-                elif tool == "storcli":
-                    if run_cmd("which storcli64 2>/dev/null") or os.path.exists("/opt/MegaRAID/storcli/storcli64"):
-                        print("[SUCCESS] {0} installed successfully.".format(tool))
-                        installed = True
-                
-                if not installed:
-                    msg = "[WARNING] {0} installation completed but binary not found in expected paths.".format(tool)
-                    print(msg)
-                    COLLECTION_ERRORS.append(msg)
-                    
-                # 删除临时文件
+                _install_pkg(tmp_file, tool)
                 try:
                     os.remove(tmp_file)
                 except:
                     pass
             else:
-                msg = "[ERROR] File not found on server repo: {0}".format(download_url)
+                msg = "[ERROR] File not found on server: {0}".format(download_url)
                 print(msg)
                 COLLECTION_ERRORS.append(msg)
         except Exception as e:
-            msg = "[ERROR] Failed to fetch tool from server: {0}".format(str(e))
+            msg = "[ERROR] Failed to fetch from server: {0}".format(str(e))
             print(msg)
             COLLECTION_ERRORS.append(msg)
 
@@ -1354,9 +1385,10 @@ def main():
     print("Collecting System Info...")
     sys_info = get_system_info()
     
-    if args.server:
-        print("Checking missing proprietary RAID utilities from server repo...")
-        auto_install_raid_tools(sys_info, args.server)
+    # 无论是否有 --server，始终尝试安装 RAID 工具
+    # 优先本地 tools/，其次远端服务器
+    print("Checking and installing RAID management tools...")
+    auto_install_raid_tools(sys_info, args.server)
 
     print("Collecting CPU Info...")
     cpu_info = get_cpu_info()
