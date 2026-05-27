@@ -71,7 +71,9 @@ def check_and_install_dependencies():
         "ip": "iproute",
         "ethtool": "ethtool",
         "lshw": "lshw",
-        "lspci": "pciutils"
+        "lspci": "pciutils",
+        "smartctl": "smartmontools",
+        "sg_inq": "sg3_utils"
     }
     
     pm = None
@@ -647,9 +649,118 @@ def get_network_info():
                     current_name = None
     return net_list
 
+def _is_wwn(sn):
+    """
+    判断给定字符串是否为 WWN/NAA 标识符，而非真实磁盘序列号。
+    - NAA-5 (SAS 物理盘 WWN):   16 位纯十六进制 (8 字节)
+    - NAA-6 (RAID 控制器 LUN): 32 位纯十六进制 (16 字节)
+    真实 SN 一般为 8-16 位字母数字混合，通常包含字母且不全是 0-9a-f。
+    """
+    if not sn or sn in ["Unknown", ""]:
+        return False
+    s = sn.strip().lower().lstrip("0x")
+    # 14~32 位纯十六进制字符 → 判定为 WWN/NAA 标识符
+    if re.match(r'^[0-9a-f]{14,32}$', s):
+        return True
+    return False
+
+
+def _get_real_disk_sn(dev_name, sn_candidate):
+    """
+    当检测到 sn_candidate 可能是 WWN 时，尝试通过多种途径获取磁盘真实序列号。
+    
+    优先级（从零依赖到有依赖）:
+      0. sysfs VPD pg80 二进制文件 (内核直接暴露，无需任何工具)
+      1. sysfs /sys/block/sdX/device/serial (内核 SCSI 层缓存)
+      2. udevadm info ID_SERIAL_SHORT
+      3. smartctl -i
+      4. sg_inq --page=0x80
+    
+    :param dev_name: 磁盘设备名，如 'sda' 或 '/dev/sda'
+    :param sn_candidate: 当前已有的 SN（可能是 WWN）
+    :return: 真实 SN 字符串，或原始候选值（若无法改善）
+    """
+    if not dev_name:
+        return sn_candidate
+    
+    # 统一设备路径和短名
+    dev_path = dev_name if dev_name.startswith("/dev/") else "/dev/" + dev_name
+    dev_short = dev_name.replace("/dev/", "")
+    
+    # ---- 方法0: 直读内核 sysfs VPD Page 0x80 二进制文件 (零依赖，最可靠) ----
+    # Linux 3.6+ 在 /sys/block/<dev>/device/vpd_pg80 暴露 SCSI Unit Serial Number 页
+    vpd_pg80_path = "/sys/block/{0}/device/vpd_pg80".format(dev_short)
+    if os.path.exists(vpd_pg80_path):
+        try:
+            with open(vpd_pg80_path, "rb") as f:
+                vpd_data = f.read()
+            # VPD pg 0x80 格式: [devtype(1)] [0x80(1)] [length_hi(1)] [length_lo(1)] [sn_ascii...]
+            if len(vpd_data) >= 4 and vpd_data[1:2] in (b'\x80', b'\x00'):
+                pg_len = (vpd_data[2] << 8 | vpd_data[3]) if len(vpd_data) > 3 else 0
+                # 兼容只有 2 字节头的简化实现
+                if pg_len == 0 and len(vpd_data) > 4:
+                    pg_len = len(vpd_data) - 4
+                sn_bytes = vpd_data[4:4 + pg_len] if pg_len > 0 else vpd_data[4:]
+                try:
+                    real_sn = sn_bytes.decode('ascii', 'ignore').strip()
+                except Exception:
+                    real_sn = ""
+                if real_sn and not _is_wwn(real_sn):
+                    return real_sn
+        except Exception:
+            pass
+    
+    # ---- 方法1: sysfs /sys/block/sdX/device/serial (内核 SCSI inquiry 缓存) ----
+    sysfs_serial_path = "/sys/block/{0}/device/serial".format(dev_short)
+    if os.path.exists(sysfs_serial_path):
+        try:
+            with open(sysfs_serial_path, "r") as f:
+                real_sn = f.read().strip()
+            if real_sn and not _is_wwn(real_sn):
+                return real_sn
+        except Exception:
+            pass
+    
+    # ---- 方法2: udevadm info ID_SERIAL_SHORT ----
+    udev_out = run_cmd("udevadm info --query=property --name={0} 2>/dev/null".format(dev_path))
+    if udev_out:
+        m = re.search(r'^ID_SERIAL_SHORT=(.+)$', udev_out, re.MULTILINE)
+        if m:
+            real_sn = m.group(1).strip()
+            if real_sn and not _is_wwn(real_sn):
+                return real_sn
+    
+    # ---- 方法3: smartctl -i (覆盖绝大多数 ATA/SATA/SAS/NVMe 盘) ----
+    smartctl_bin = run_cmd("which smartctl 2>/dev/null").strip()
+    if smartctl_bin:
+        smartctl_out = run_cmd("{0} -i {1} 2>/dev/null".format(smartctl_bin, dev_path))
+        if smartctl_out:
+            m = re.search(r'^Serial Number:\s*(\S+)', smartctl_out, re.MULTILINE | re.IGNORECASE)
+            if m:
+                real_sn = m.group(1).strip()
+                if real_sn and not _is_wwn(real_sn):
+                    return real_sn
+    
+    # ---- 方法4: sg_inq --page=0x80 (专为 SAS/SCSI 设备) ----
+    sginq_bin = run_cmd("which sg_inq 2>/dev/null").strip()
+    if sginq_bin:
+        vpd_out = run_cmd("{0} --page=0x80 {1} 2>/dev/null".format(sginq_bin, dev_path))
+        if vpd_out:
+            m = re.search(r'Unit serial number:\s*(\S+)', vpd_out, re.IGNORECASE)
+            if m:
+                real_sn = m.group(1).strip()
+                if real_sn and not _is_wwn(real_sn):
+                    return real_sn
+    
+    # 所有方法均未能改善，返回原候选值
+    return sn_candidate
+
+
 def get_disk_info():
     """
     智能下钻物理硬盘及其 SN。此环节是跨硬件管理的核心痛点。
+    针对华为 2288H 等服务器，lsblk/storcli 对 SAS 盘返回的 SERIAL
+    可能是 WWN 而非真实制造商序列号，需通过 udevadm/smartctl/sg_inq 修正。
     """
     disks = []
     
@@ -673,10 +784,33 @@ def get_disk_info():
                                     clean_model = re.sub(r'^(ATA|NVMe)\s+', '', raw_model).strip()
                                     parts = clean_model.split(None, 1)
                                     
+                                    raw_sn = drive.get("SN", "Unknown").strip()
+                                    # 华为 2288H 等服务器 storcli 可能将 WWN 误报为 SN，尝试修正
+                                    if _is_wwn(raw_sn):
+                                        # storcli 无法直接给出设备名，只能通过操作系统层枚举后匹配
+                                        # 此处标记为 WWN 以便后续处理
+                                        real_sn = raw_sn  # 先保留原值
+                                        # 通过 /dev/sd* 枚举尝试匹配 WWN 关联的设备
+                                        try:
+                                            import glob
+                                            for blk_dev in sorted(glob.glob("/dev/sd?") + glob.glob("/dev/sd??")):
+                                                udev_out = run_cmd("udevadm info --query=property --name={0} 2>/dev/null".format(blk_dev))
+                                                if udev_out:
+                                                    wwn_m = re.search(r'^ID_WWN=0x([0-9a-fA-F]+)$', udev_out, re.MULTILINE)
+                                                    wwn_cand = wwn_m.group(1).strip().lower() if wwn_m else ""
+                                                    sn_strip = raw_sn.strip().lower().lstrip("0x")
+                                                    if wwn_cand and (sn_strip == wwn_cand or sn_strip in wwn_cand or wwn_cand in sn_strip):
+                                                        real_sn = _get_real_disk_sn(blk_dev, raw_sn)
+                                                        break
+                                        except Exception:
+                                            pass
+                                    else:
+                                        real_sn = raw_sn
+                                    
                                     disks.append({
                                         "manufacturer": parts[0] if len(parts) > 1 else "Unknown",
                                         "model": parts[1] if len(parts) > 1 else clean_model,
-                                        "serial_number": drive.get("SN", "Unknown").strip(),
+                                        "serial_number": real_sn,
                                         "size": drive.get("Size", "Unknown"),
                                         "type": drive.get("Med", "Unknown") + " / " + drive.get("Intf", "Unknown"),
                                         "provider": "LSI-storcli"
@@ -858,8 +992,14 @@ def get_disk_info():
                 if rota is not None:
                     disk_type = "HDD" if (rota == True or rota == 1 or str(rota) == "1") else "SSD"
                 
+                # 华为 2288H 等服务器的 SAS 磁盘，lsblk SERIAL 字段可能返回 WWN
+                # 需通过 udevadm/smartctl/sg_inq 获取真实制造商序列号
+                dev_name_str = dev.get("name", "")
+                if _is_wwn(serial) and dev_name_str:
+                    serial = _get_real_disk_sn(dev_name_str, serial)
+                
                 disks.append({
-                    "name": dev.get("name", "?"),
+                    "name": dev_name_str or "?",
                     "manufacturer": manufacturer,
                     "model": model,
                     "serial_number": serial,
@@ -898,8 +1038,13 @@ def get_disk_info():
                     manufacturer = m_parts[0]
                     model = m_parts[1]
                 
+                # 同样检测并修正 lsblk -P 模式下返回的 WWN
+                dev_name_str = fields.get("NAME", "")
+                if _is_wwn(serial) and dev_name_str:
+                    serial = _get_real_disk_sn(dev_name_str, serial)
+                
                 disks.append({
-                    "name": fields.get("NAME", "?"),
+                    "name": dev_name_str or "?",
                     "manufacturer": manufacturer,
                     "model": model,
                     "serial_number": serial,
